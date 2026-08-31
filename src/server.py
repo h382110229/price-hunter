@@ -1,10 +1,11 @@
 """FastMCP 入口 — 注册比价搜索 MCP Tools。
 
 Tools:
-  - search_products    跨平台商品搜索 (并发)
-  - get_product_detail  单品详情
-  - compare_prices     多平台比价 (并发 + 全局排序)
-  - get_coupons        优惠券搜索
+  - search_products     跨平台商品搜索 (并发)
+  - get_product_detail   单品详情
+  - compare_prices      多平台比价 (并发 + 全局排序)
+  - get_coupons         优惠券搜索
+  - parse_and_compare   分享链接/口令解析 + 全网找同款比价
 
 当凭据未配置时，所有引擎自动降级为 Mock/Dry-run 模式。
 """
@@ -21,7 +22,8 @@ from src.engines.base import BaseEngine
 from src.engines.jd import JDEngine
 from src.engines.pdd import PDDEngine
 from src.engines.taobao import TaobaoEngine
-from src.models import CompareResult, Coupon, Platform, Product
+from src.models import CompareResult, Coupon, Platform, Product, ReverseCompareResult
+from src.parsers.link_extractor import ParsedLink, extract_links, get_search_keyword
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +37,8 @@ mcp = MCPServer(
 # ── 引擎工厂 ─────────────────────────────────────────────
 
 def _engines() -> list[BaseEngine]:
-    """按凭据可用性实例化引擎。
-    未配置凭据的引擎也会被加入 (Dry-run 模式)。
-    """
     from src.config import settings
-
-    engines: list[BaseEngine] = []
-    engines.append(TaobaoEngine())  # 内部自动判断 dry_run
-    engines.append(JDEngine())
-    engines.append(PDDEngine())
+    engines: list[BaseEngine] = [TaobaoEngine(), JDEngine(), PDDEngine()]
     return engines
 
 
@@ -56,8 +51,6 @@ def _filter_engines(engines: list[BaseEngine], platform: str) -> list[BaseEngine
 async def _concurrent_search(
     engines: list[BaseEngine], keyword: str, page: int, page_size: int
 ) -> list[Product]:
-    """并发查询所有引擎，合并结果。"""
-
     async def _safe_search(engine: BaseEngine) -> list[Product]:
         try:
             return await engine.search(keyword, page, page_size)
@@ -70,6 +63,23 @@ async def _concurrent_search(
     tasks = [_safe_search(e) for e in engines]
     results = await asyncio.gather(*tasks)
     return [p for batch in results for p in batch]
+
+
+async def _get_source_product(parsed: ParsedLink) -> Product | None:
+    """获取源商品详情 (真实 API 或 Mock)"""
+    engine_map = {
+        Platform.TAOBAO: TaobaoEngine,
+        Platform.JD: JDEngine,
+        Platform.PDD: PDDEngine,
+    }
+    engine_cls = engine_map.get(parsed.platform)
+    if not engine_cls:
+        return None
+    async with engine_cls() as engine:
+        try:
+            return await engine.detail(parsed.item_id)
+        except Exception:
+            return None
 
 
 # ── MCP Tools ─────────────────────────────────────────────
@@ -160,6 +170,56 @@ async def get_coupons(
     results = await asyncio.gather(*tasks)
     coupons = [c for batch in results for c in batch]
     return [c.model_dump() for c in coupons]
+
+
+@mcp.tool()
+async def parse_and_compare(raw_text: str, page_size: int = 5) -> dict[str, Any]:
+    """解析分享链接/淘口令，自动找全网同款并比价。
+
+    从用户分享的文本中提取商品标识 (淘口令/京东链接/拼多多链接)，
+    查询原品价格，然后跨平台搜索同款，输出比价报告。
+
+    Args:
+        raw_text: 包含商品链接或口令的分享文本
+        page_size: 每平台取前 N 个同款结果
+    """
+    # 1. 解析文本
+    parsed_list = extract_links(raw_text)
+    if not parsed_list:
+        return {"error": "未从文本中识别到任何商品链接或口令", "raw_text": raw_text[:200]}
+
+    parsed = parsed_list[0]  # 取最高优先级
+
+    # 2. 获取原品详情
+    source_product = await _get_source_product(parsed)
+
+    source_title = source_product.title if source_product else ""
+    source_price = source_product.price if source_product else 0.0
+    source_coupon = source_product.coupon_amount if source_product else 0.0
+    source_final = source_product.final_price if source_product else source_price
+
+    # 3. 确定搜索关键词
+    keyword = get_search_keyword(parsed, source_title)
+    if not keyword:
+        keyword = parsed.item_id  # fallback: 用 ID 搜
+
+    # 4. 全网找同款比价 (排除原品所在平台的结果中去重)
+    engines = _engines()
+    all_products = await _concurrent_search(engines, keyword, page=1, page_size=page_size)
+
+    # 5. 构建反向比价结果
+    result = ReverseCompareResult(
+        source_text=raw_text[:200],
+        source_platform=parsed.platform.value,
+        source_product_id=parsed.item_id,
+        source_title=source_title,
+        source_price=source_price,
+        source_coupon=source_coupon,
+        source_final_price=source_final,
+        keyword=keyword,
+        cross_platform=all_products,
+    )
+    return result.model_dump()
 
 
 # ── 入口 ──────────────────────────────────────────────────
