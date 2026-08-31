@@ -12,12 +12,17 @@ import os
 import pytest
 
 # ── 强制清空凭据，确保 Dry-run 模式 ──────────────────────
+# Set env vars to empty strings to override .env file on disk
 for var in [
     "TB_APP_KEY", "TB_APP_SECRET", "TB_ADZONE_ID",
     "JD_APP_KEY", "JD_APP_SECRET", "JD_SITE_ID",
     "PDD_CLIENT_ID", "PDD_CLIENT_SECRET", "PDD_PID",
 ]:
-    os.environ.pop(var, None)
+    os.environ[var] = ""
+
+# Reload config singleton with cleared env
+import src.config
+src.config.settings = src.config.Settings()
 
 from src.engines.base import BaseEngine, md5_sign, pdd_sign
 from src.engines.jd import JDEngine

@@ -15,7 +15,7 @@ import json
 import logging
 from datetime import datetime
 
-from src.config import settings
+import src.config as _cfg
 from src.engines.base import (
     ApiBusinessError,
     BaseEngine,
@@ -34,8 +34,8 @@ class JDEngine(BaseEngine):
     base_url = "https://api.jd.com/routerjson"
 
     def __init__(self) -> None:
-        super().__init__(settings.jd_app_key, settings.jd_app_secret)
-        self.site_id = settings.jd_site_id
+        super().__init__(_cfg.settings.jd_app_key, _cfg.settings.jd_app_secret)
+        self.site_id = _cfg.settings.jd_site_id
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import md5_sign

@@ -15,7 +15,7 @@ import json
 import logging
 import time
 
-from src.config import settings
+import src.config as _cfg
 from src.engines.base import (
     ApiBusinessError,
     BaseEngine,
@@ -38,8 +38,8 @@ class PDDEngine(BaseEngine):
     base_url = "https://gw-api.pinduoduo.com/api/router"
 
     def __init__(self) -> None:
-        super().__init__(settings.pdd_client_id, settings.pdd_client_secret)
-        self.pid = settings.pdd_pid
+        super().__init__(_cfg.settings.pdd_client_id, _cfg.settings.pdd_client_secret)
+        self.pid = _cfg.settings.pdd_pid
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import pdd_sign

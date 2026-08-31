@@ -14,7 +14,7 @@ import json
 import logging
 from datetime import datetime
 
-from src.config import settings
+import src.config as _cfg
 from src.engines.base import (
     ApiBusinessError,
     BaseEngine,
@@ -38,8 +38,8 @@ class TaobaoEngine(BaseEngine):
     base_url = "https://eco.taobao.com/router/rest"
 
     def __init__(self) -> None:
-        super().__init__(settings.tb_app_key, settings.tb_app_secret)
-        self.adzone_id = settings.tb_adzone_id
+        super().__init__(_cfg.settings.tb_app_key, _cfg.settings.tb_app_secret)
+        self.adzone_id = _cfg.settings.tb_adzone_id
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import md5_sign
