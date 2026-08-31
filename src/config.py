@@ -6,38 +6,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class TaobaoConfig(BaseSettings):
-    """淘宝联盟 (Taobao客 TOP API) 配置"""
-
-    model_config = SettingsConfigDict(env_prefix="TB_")
-
-    app_key: str = ""
-    app_secret: str = ""
-    adzone_id: str = ""
-
-
-class JDConfig(BaseSettings):
-    """京东联盟 (JD Union Open Platform) 配置"""
-
-    model_config = SettingsConfigDict(env_prefix="JD_")
-
-    app_key: str = ""
-    app_secret: str = ""
-    site_id: str = ""
-
-
-class PDDConfig(BaseSettings):
-    """多多进宝 (PDD Open Platform) 配置"""
-
-    model_config = SettingsConfigDict(env_prefix="PDD_")
-
-    client_id: str = ""
-    client_secret: str = ""
-    pid: str = ""
-
-
 class Settings(BaseSettings):
-    """全局配置聚合"""
+    """全局配置 — 所有字段平铺在顶层，确保 .env 正确加载"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -45,9 +15,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    taobao: TaobaoConfig = TaobaoConfig()
-    jd: JDConfig = JDConfig()
-    pdd: PDDConfig = PDDConfig()
+    # ── 淘宝联盟 ──
+    tb_app_key: str = ""
+    tb_app_secret: str = ""
+    tb_adzone_id: str = ""
+
+    # ── 京东联盟 ──
+    jd_app_key: str = ""
+    jd_app_secret: str = ""
+    jd_site_id: str = ""
+
+    # ── 多多进宝 ──
+    pdd_client_id: str = ""
+    pdd_client_secret: str = ""
+    pdd_pid: str = ""
 
 
 # 全局单例 — import 即可用

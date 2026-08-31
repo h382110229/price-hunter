@@ -34,9 +34,8 @@ class JDEngine(BaseEngine):
     base_url = "https://api.jd.com/routerjson"
 
     def __init__(self) -> None:
-        cfg = settings.jd
-        super().__init__(cfg.app_key, cfg.app_secret)
-        self.site_id = cfg.site_id
+        super().__init__(settings.jd_app_key, settings.jd_app_secret)
+        self.site_id = settings.jd_site_id
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import md5_sign

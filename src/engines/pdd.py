@@ -38,9 +38,8 @@ class PDDEngine(BaseEngine):
     base_url = "https://gw-api.pinduoduo.com/api/router"
 
     def __init__(self) -> None:
-        cfg = settings.pdd
-        super().__init__(cfg.client_id, cfg.client_secret)
-        self.pid = cfg.pid
+        super().__init__(settings.pdd_client_id, settings.pdd_client_secret)
+        self.pid = settings.pdd_pid
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import pdd_sign

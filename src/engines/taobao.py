@@ -38,9 +38,8 @@ class TaobaoEngine(BaseEngine):
     base_url = "https://eco.taobao.com/router/rest"
 
     def __init__(self) -> None:
-        cfg = settings.taobao
-        super().__init__(cfg.app_key, cfg.app_secret)
-        self.adzone_id = cfg.adzone_id
+        super().__init__(settings.tb_app_key, settings.tb_app_secret)
+        self.adzone_id = settings.tb_adzone_id
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import md5_sign
