@@ -7,10 +7,12 @@
 - get_coupons() → 优惠券查询
 
 当凭据未配置时，引擎自动降级为 Mock/Dry-run 模式，返回真实结构的模拟数据。
+包含统一的 HTTP 重试机制与业务级错误分类。
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -26,7 +28,46 @@ from src.models import Coupon, Platform, Product
 logger = logging.getLogger(__name__)
 
 
-# ── 签名工具函数 (可独立使用 / 测试) ─────────────────────
+# ═══════════════════════════════════════════════════════════
+# 自定义异常 — 三类错误分明，避免静默失败
+# ═══════════════════════════════════════════════════════════
+
+class EngineError(Exception):
+    """引擎基类异常"""
+
+
+class NetworkError(EngineError):
+    """网络超时 / 连接失败 / HTTP 非 200"""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class ApiBusinessError(EngineError):
+    """联盟平台返回的业务级错误（签名错误、权限不足、限流等）"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        platform: Platform,
+        error_code: str = "",
+        sub_code: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.platform = platform
+        self.error_code = error_code
+        self.sub_code = sub_code
+
+
+class ConfigMissingError(EngineError):
+    """凭据未配置 (Dry-run 模式下不应触发此异常，仅用于探测脚本)"""
+
+
+# ═══════════════════════════════════════════════════════════
+# 签名工具函数 (可独立使用 / 测试)
+# ═══════════════════════════════════════════════════════════
 
 def md5_sign(params: dict[str, str], secret: str) -> str:
     """通用 MD5 签名 (淘宝 TOP API / 京东联盟)。
@@ -50,7 +91,9 @@ def pdd_sign(params: dict[str, str], secret: str) -> str:
     return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
 
 
-# ── Mock 数据工厂 ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# Mock 数据工厂
+# ═══════════════════════════════════════════════════════════
 
 _MOCK_KEYWORDS: dict[str, list[dict[str, Any]]] = {
     "耳机": [
@@ -132,12 +175,69 @@ def _mock_coupons(keyword: str, platform: Platform) -> list[Coupon]:
     ]
 
 
-# ── 引擎基类 ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# HTTP 重试工具
+# ═══════════════════════════════════════════════════════════
+
+_MAX_RETRIES = 2
+_RETRY_BACKOFF = [1.0, 3.0]  # 指数退避 (秒)
+
+
+async def _retry_request(
+    func,
+    *args,
+    max_retries: int = _MAX_RETRIES,
+    backoff: list[float] | None = None,
+) -> Any:
+    """带指数退避的异步重试包装器。
+
+    仅对网络层错误 (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError 5xx) 重试。
+    业务级错误 (ApiBusinessError) 不重试，直接抛出。
+    """
+    if backoff is None:
+        backoff = _RETRY_BACKOFF
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await func(*args)
+        except ApiBusinessError:
+            raise  # 业务错误不重试
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_exc = e
+            if attempt < max_retries:
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                logger.warning(
+                    "网络错误 (attempt %d/%d): %s — %.1fs 后重试",
+                    attempt + 1, max_retries + 1, e, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error("网络错误 (已耗尽重试): %s", e)
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            status = e.response.status_code
+            if status >= 500 and attempt < max_retries:
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                logger.warning(
+                    "HTTP %d (attempt %d/%d) — %.1fs 后重试",
+                    status, attempt + 1, max_retries + 1, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise NetworkError(f"HTTP {status}: {e}", status_code=status)
+
+    raise NetworkError(f"请求失败 (已重试 {max_retries} 次): {last_exc}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 引擎基类
+# ═══════════════════════════════════════════════════════════
 
 class BaseEngine(ABC):
     """联盟 API 引擎抽象基类
 
-    - 配置了凭据 → 真实 API 调用
+    - 配置了凭据 → 真实 API 调用 (带重试)
     - 未配置凭据 → Mock/Dry-run 模式，返回模拟数据
     """
 
@@ -154,7 +254,11 @@ class BaseEngine(ABC):
                 "%s: 凭据未配置，启用 Mock/Dry-run 模式",
                 self.__class__.__name__,
             )
-        self._client = httpx.AsyncClient(timeout=15.0)
+        # 生产级超时: 连接 5s, 读取 10s
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=5),
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -165,7 +269,7 @@ class BaseEngine(ABC):
     def _sign(self, params: dict[str, str]) -> str:
         ...
 
-    # ── 通用 HTTP ─────────────────────────────────────────
+    # ── 通用 HTTP (带重试) ────────────────────────────────
 
     async def _request(
         self,
@@ -175,11 +279,16 @@ class BaseEngine(ABC):
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        resp = await self._client.request(
-            method, url, params=params, json=json_body
-        )
-        resp.raise_for_status()
-        return resp.json()
+        """发送 HTTP 请求 (带自动重试)，返回 JSON 响应"""
+
+        async def _do_request() -> dict[str, Any]:
+            resp = await self._client.request(
+                method, url, params=params, json=json_body
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        return await _retry_request(_do_request)
 
     # ── 业务接口 ──────────────────────────────────────────
 

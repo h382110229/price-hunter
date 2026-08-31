@@ -3,6 +3,10 @@
 API 文档: https://union.jd.com/openplatform/api
 签名方式: MD5(secret + sorted_kv + secret).upper()
 接口: jd.union.open.goods.query (商品查询)
+
+业务错误码:
+- result.code: 200=成功, 其他=失败
+- result.message: 错误描述 (含 "sign" 关键词表示签名错误)
 """
 
 from __future__ import annotations
@@ -12,7 +16,12 @@ import logging
 from datetime import datetime
 
 from src.config import settings
-from src.engines.base import BaseEngine, _mock_coupons, _mock_products
+from src.engines.base import (
+    ApiBusinessError,
+    BaseEngine,
+    _mock_coupons,
+    _mock_products,
+)
 from src.models import Coupon, Platform, Product
 
 logger = logging.getLogger(__name__)
@@ -31,7 +40,6 @@ class JDEngine(BaseEngine):
 
     def _sign(self, params: dict[str, str]) -> str:
         from src.engines.base import md5_sign
-
         return md5_sign(params, self.app_secret)
 
     def _common_params(self, method: str) -> dict[str, str]:
@@ -48,21 +56,63 @@ class JDEngine(BaseEngine):
         params = self._common_params(method)
         params["param_json"] = param_json
         params["sign"] = self._sign(params)
-        return await self._request("POST", self.base_url, params=params)
+        resp = await self._request("POST", self.base_url, params=params)
+        self._check_business_error(resp, method)
+        return resp
+
+    def _check_business_error(self, resp: dict, method: str) -> None:
+        """检查京东联盟业务级错误"""
+        # 京东响应结构: {method}_responce → {code, message, result}
+        resp_key = method.replace(".", "_") + "_responce"
+        wrapper = resp.get(resp_key, resp)
+
+        code = wrapper.get("code", 200)
+        if code == 200:
+            # 还需检查内层 result
+            try:
+                inner = json.loads(wrapper.get("queryResult", wrapper.get("result", "{}")))
+                result_code = inner.get("code", 200)
+                if result_code != 200:
+                    msg = inner.get("message", "")
+                    self._classify_jd_error(str(result_code), msg)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return
+
+        msg = wrapper.get("message", "")
+        self._classify_jd_error(str(code), msg)
+
+    def _classify_jd_error(self, code: str, msg: str) -> None:
+        """分类京东错误码"""
+        msg_lower = msg.lower()
+        if "sign" in msg_lower or code in ("3", "11"):
+            logger.error("🔴 京东签名错误 [%s]: %s — 请检查 JD_APP_SECRET", code, msg)
+            raise ApiBusinessError(
+                f"京东签名错误 [{code}]: {msg}",
+                platform=self.platform, error_code=code,
+            )
+        if "auth" in msg_lower or "unauthorized" in msg_lower or code in ("12", "13"):
+            logger.error("🔴 京东鉴权失败 [%s]: %s — 请检查 JD_APP_KEY", code, msg)
+            raise ApiBusinessError(
+                f"京东鉴权失败 [{code}]: {msg}",
+                platform=self.platform, error_code=code,
+            )
+        if "limit" in msg_lower or "rate" in msg_lower or code == "28":
+            logger.warning("🟡 京东限流 [%s]: %s", code, msg)
+            raise ApiBusinessError(
+                f"京东限流 [{code}]: {msg}",
+                platform=self.platform, error_code=code,
+            )
+        logger.warning("京东业务错误 [%s]: %s", code, msg)
+        raise ApiBusinessError(
+            f"京东错误 [{code}]: {msg}",
+            platform=self.platform, error_code=code,
+        )
 
     def _parse_product(self, item: dict) -> Product:
-        """解析京东 API 返回的商品数据。
-
-        关键字段映射:
-        - item["priceInfo"]["price"]          → 面价
-        - item["couponInfo"]["couponList"]    → 优惠券列表
-        - item["promotionInfo"]["clickURL"]   → 推广链接
-        - item["shopInfo"]["shopName"]        → 店铺名
-        """
         price_info = item.get("priceInfo", {})
         price = float(price_info.get("price", 0))
 
-        # 提取最优优惠券
         coupon_info = item.get("couponInfo", {})
         coupon_list = coupon_info.get("couponList", [])
         best_discount = 0.0
@@ -77,43 +127,28 @@ class JDEngine(BaseEngine):
             min_spend = float(best.get("quota", 0))
 
         final_price = max(0.0, price - best_discount)
-
-        # 推广链接
         promotion_info = item.get("promotionInfo", {})
         click_url = promotion_info.get("clickURL", "")
-
-        # 店铺
         shop_info = item.get("shopInfo", {})
-
-        # 销量
         in_order_count = item.get("inOrderCount30Days", item.get("inOrderCount30DaysSku", 0))
 
         coupons = []
         if best_discount > 0:
-            coupons.append(
-                Coupon(
-                    platform=self.platform,
-                    coupon_id=coupon_id,
-                    title=f"满{min_spend:.0f}减{best_discount:.0f}",
-                    discount=best_discount,
-                    min_spend=min_spend,
-                    url=coupon_url,
-                )
-            )
+            coupons.append(Coupon(
+                platform=self.platform, coupon_id=coupon_id,
+                title=f"满{min_spend:.0f}减{best_discount:.0f}",
+                discount=best_discount, min_spend=min_spend, url=coupon_url,
+            ))
 
         return Product(
             platform=self.platform,
             product_id=str(item.get("skuId", "")),
             title=item.get("skuName", ""),
-            price=price,
-            coupon_amount=best_discount,
-            final_price=final_price,
+            price=price, coupon_amount=best_discount, final_price=final_price,
             original_price=float(price_info.get("price", 0)),
-            url=click_url,
-            coupon_url=coupon_url,
+            url=click_url, coupon_url=coupon_url,
             image_url=item.get("imageInfo", {}).get("imageList", [{}])[0].get("url", "")
-            if item.get("imageInfo", {}).get("imageList")
-            else "",
+            if item.get("imageInfo", {}).get("imageList") else "",
             detail_url=f"https://item.jd.com/{item.get('skuId', '')}.html",
             shop_name=shop_info.get("shopName", ""),
             sales_volume=int(in_order_count) if in_order_count else 0,
@@ -122,20 +157,10 @@ class JDEngine(BaseEngine):
         )
 
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
-        """搜索京东联盟商品 (jd.union.open.goods.query)"""
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
 
-        param = json.dumps(
-            {
-                "goodsReq": {
-                    "keyword": keyword,
-                    "pageIndex": page,
-                    "pageSize": page_size,
-                    "siteId": self.site_id,
-                }
-            }
-        )
+        param = json.dumps({"goodsReq": {"keyword": keyword, "pageIndex": page, "pageSize": page_size, "siteId": self.site_id}})
         resp = await self._jd_request("jd.union.open.goods.query", param)
         try:
             result = resp.get("jd_union_open_goods_query_responce", {})
@@ -143,11 +168,10 @@ class JDEngine(BaseEngine):
             items = data.get("data", [])
             return [self._parse_product(item) for item in items]
         except (KeyError, TypeError, json.JSONDecodeError) as e:
-            logger.warning("京东搜索解析失败: %s, resp=%s", e, json.dumps(resp, ensure_ascii=False)[:500])
+            logger.warning("京东搜索解析失败: %s", e)
             return []
 
     async def detail(self, product_id: str) -> Product:
-        """获取京东商品详情 (jd.union.open.goods.promotiongoodsinfo.query)"""
         if self.dry_run:
             products = _mock_products("detail", self.platform, 1)
             p = products[0]
@@ -155,9 +179,7 @@ class JDEngine(BaseEngine):
             return p
 
         param = json.dumps({"skuIds": product_id})
-        resp = await self._jd_request(
-            "jd.union.open.goods.promotiongoodsinfo.query", param
-        )
+        resp = await self._jd_request("jd.union.open.goods.promotiongoodsinfo.query", param)
         try:
             result = resp.get("jd_union_open_goods_promotiongoodsinfo_query_responce", {})
             data = json.loads(result.get("queryResult", "{}"))
@@ -170,27 +192,19 @@ class JDEngine(BaseEngine):
             raise
 
     async def get_coupons(self, keyword: str, page: int = 1) -> list[Coupon]:
-        """搜索京东优惠券 (jd.union.open.coupon.query)"""
         if self.dry_run:
             return _mock_coupons(keyword, self.platform)
 
-        param = json.dumps(
-            {"couponUrls": [], "pageIndex": page, "pageSize": 20}
-        )
+        param = json.dumps({"couponUrls": [], "pageIndex": page, "pageSize": 20})
         resp = await self._jd_request("jd.union.open.coupon.query", param)
         try:
             result = resp.get("jd_union_open_coupon_query_responce", {})
             data = json.loads(result.get("queryResult", "{}"))
             items = data.get("data", [])
             return [
-                Coupon(
-                    platform=self.platform,
-                    coupon_id=str(c.get("couponId", "")),
-                    title=c.get("couponName", ""),
-                    discount=float(c.get("discount", 0)),
-                    min_spend=float(c.get("quota", 0)),
-                    url=c.get("link", ""),
-                )
+                Coupon(platform=self.platform, coupon_id=str(c.get("couponId", "")),
+                       title=c.get("couponName", ""), discount=float(c.get("discount", 0)),
+                       min_spend=float(c.get("quota", 0)), url=c.get("link", ""))
                 for c in items
             ]
         except (KeyError, TypeError, json.JSONDecodeError) as e:
