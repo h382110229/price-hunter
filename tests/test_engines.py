@@ -174,7 +174,7 @@ class TestCompareResult:
         ]
         result = CompareResult(keyword="耳机", products=products)
         assert "耳机" in result.summary
-        assert "全网最低" in result.summary
+        assert "🏆" in result.summary
 
     def test_empty_products(self):
         """空结果"""

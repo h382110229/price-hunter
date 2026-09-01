@@ -26,6 +26,12 @@ _PLATFORM_NAMES: dict[Platform, str] = {
     Platform.PDD: "拼多多",
 }
 
+_PLATFORM_EMOJI: dict[Platform, str] = {
+    Platform.TAOBAO: "🟠",
+    Platform.JD: "🔴",
+    Platform.PDD: "🟤",
+}
+
 
 class Coupon(BaseModel):
     """优惠券信息"""
@@ -65,6 +71,18 @@ class Product(BaseModel):
             self.final_price = max(0.0, self.price - self.coupon_amount)
 
 
+def _fmt_price(price: float) -> str:
+    """格式化价格: 整数不带小数，否则保留2位"""
+    if price == int(price):
+        return f"¥{int(price)}"
+    return f"¥{price:.2f}"
+
+
+def _truncate(s: str, max_len: int = 30) -> str:
+    """截断字符串"""
+    return s[:max_len] + "…" if len(s) > max_len else s
+
+
 class CompareResult(BaseModel):
     """比价结果"""
 
@@ -82,43 +100,81 @@ class CompareResult(BaseModel):
 
     def _build_summary(self) -> str:
         if not self.products:
-            return f"「{self.keyword}」在所有平台均无搜索结果。"
+            return f"🔍 「{self.keyword}」— 全网无搜索结果"
 
-        lines = [f"🔍 「{self.keyword}」全网比价结果（共 {len(self.products)} 件）：\n"]
+        lines: list[str] = []
+
+        # ── 最低价推荐卡片 ──
+        mp = self.min_price_product
+        if mp:
+            mp_name = _PLATFORM_NAMES[mp.platform]
+            mp_emoji = _PLATFORM_EMOJI[mp.platform]
+            coupon_tag = f"（券 {_fmt_price(mp.coupon_amount)}）" if mp.coupon_amount > 0 else ""
+            lines.append(f"## 🏆 最低价推荐")
+            lines.append("")
+            lines.append(f"> {mp_emoji} **{mp_name}** — {_truncate(mp.title, 40)}")
+            lines.append(f">")
+            if mp.coupon_amount > 0:
+                lines.append(f"> 原价 ~~{_fmt_price(mp.price)}~~ → 券后 **{_fmt_price(mp.final_price)}** {coupon_tag}")
+            else:
+                lines.append(f"> 价格 **{_fmt_price(mp.final_price)}**")
+            if mp.url:
+                lines.append(f"> 🔗 [直达链接]({mp.url})")
+            elif mp.tkl_or_command:
+                lines.append(f"> 📋 淘口令: `{mp.tkl_or_command}`")
+            lines.append("")
+
+        # ── 省钱提示 ──
+        if len(self.products) >= 2:
+            diff = self.products[-1].final_price - self.products[0].final_price
+            if diff > 0:
+                lines.append(f"💰 **最高可省 {_fmt_price(diff)}** (最低 vs 最高)")
+                lines.append("")
+
+        # ── 比价表格 ──
+        lines.append(f"## 🔍 「{self.keyword}」全网比价（{len(self.products)} 件）")
+        lines.append("")
+        lines.append("| # | 平台 | 商品 | 原价 | 优惠券 | 到手价 | 链接 |")
+        lines.append("|---|------|------|------|--------|--------|------|")
+
         for i, p in enumerate(self.products[:10], 1):
-            tag = "🏆 全网最低" if i == 1 else ""
-            coupon_info = f"（券{p.coupon_amount:.0f}元）" if p.coupon_amount > 0 else ""
             name = _PLATFORM_NAMES[p.platform]
-            lines.append(f"{i}. [{name}] {p.title[:40]}… — ¥{p.final_price:.2f}{coupon_info} {tag}")
+            emoji = _PLATFORM_EMOJI[p.platform]
+            tag = " 🏆" if i == 1 else ""
+            coupon = f"¥{p.coupon_amount:.0f}" if p.coupon_amount > 0 else "-"
+            title_short = _truncate(p.title, 25)
 
-        if self.min_price_product:
-            mp = self.min_price_product
-            name = _PLATFORM_NAMES[mp.platform]
-            lines.append(f"\n💰 推荐：{name}「{mp.title[:30]}」¥{mp.final_price:.2f}")
+            # 链接: 优先淘口令，其次url
+            if p.tkl_or_command:
+                link = f"`{p.tkl_or_command}`"
+            elif p.url:
+                link = f"[🔗]({p.url})"
+            elif p.coupon_url:
+                link = f"[🎫]({p.coupon_url})"
+            else:
+                link = "-"
+
+            lines.append(
+                f"| {i} | {emoji} {name} | {title_short}{tag} | {_fmt_price(p.price)} | {coupon} | **{_fmt_price(p.final_price)}** | {link} |"
+            )
+
         return "\n".join(lines)
 
 
 class ReverseCompareResult(BaseModel):
-    """反向比价结果 — 用户分享某平台商品，找其他平台同款最低价
+    """反向比价结果"""
 
-    - source_product: 用户分享的原品信息
-    - cross_platform: 全网同款比价结果 (按 final_price 升序)
-    - best_deal: 全网最优 (可能是原品，也可能是其他平台)
-    - savings: 对比原品可节省的金额 (元)
-    - summary: LLM 友好的比价报告
-    """
-
-    source_text: str = ""  # 原始分享文本
+    source_text: str = ""
     source_platform: str = ""
     source_product_id: str = ""
     source_title: str = ""
     source_price: float = 0.0
     source_coupon: float = 0.0
     source_final_price: float = 0.0
-    keyword: str = ""  # 用于找同款的关键词
+    keyword: str = ""
     cross_platform: list[Product] = Field(default_factory=list)
     best_deal: Optional[Product] = None
-    savings: float = 0.0  # 对比原品可省多少
+    savings: float = 0.0
     summary: str = ""
 
     def model_post_init(self, __context: object) -> None:
@@ -132,43 +188,68 @@ class ReverseCompareResult(BaseModel):
 
     def _build_summary(self) -> str:
         lines: list[str] = []
-        lines.append(f"🔄 反向比价报告\n")
         src_name = _PLATFORM_NAMES.get(Platform(self.source_platform), self.source_platform) if self.source_platform else "未知"
-        lines.append(f"📌 原品来源: {src_name}")
+        src_emoji = _PLATFORM_EMOJI.get(Platform(self.source_platform), "⚪") if self.source_platform else "⚪"
+
+        # ── 原品信息卡片 ──
+        lines.append("## 📌 原品信息")
+        lines.append("")
+        lines.append(f"> {src_emoji} **{src_name}**")
         if self.source_title:
-            lines.append(f"📌 原品标题: {self.source_title[:50]}")
-        lines.append(f"📌 原品面价: ¥{self.source_price:.2f}")
+            lines.append(f"> {_truncate(self.source_title, 50)}")
+        lines.append(f">")
+        lines.append(f"> 面价 {_fmt_price(self.source_price)}")
         if self.source_coupon > 0:
-            lines.append(f"📌 原品隐藏券: ¥{self.source_coupon:.0f}")
-        lines.append(f"📌 原品到手价: ¥{self.source_final_price:.2f}")
-        lines.append(f"📌 搜索关键词: {self.keyword}\n")
+            lines.append(f"> 隐藏券 {_fmt_price(self.source_coupon)}")
+        lines.append(f"> 到手价 **{_fmt_price(self.source_final_price)}**")
+        lines.append("")
 
         if not self.cross_platform:
             lines.append("❌ 未找到全网同款商品。")
             return "\n".join(lines)
 
-        lines.append(f"🔍 全网同款比价（共 {len(self.cross_platform)} 件）：\n")
+        # ── 最优推荐 ──
+        if self.best_deal:
+            bd = self.best_deal
+            bd_name = _PLATFORM_NAMES[bd.platform]
+            bd_emoji = _PLATFORM_EMOJI[bd.platform]
+            lines.append("## 🏆 最优推荐")
+            lines.append("")
+            lines.append(f"> {bd_emoji} **{bd_name}** — {_truncate(bd.title, 40)}")
+            lines.append(f">")
+            if bd.coupon_amount > 0:
+                lines.append(f"> 原价 ~~{_fmt_price(bd.price)}~~ → 券后 **{_fmt_price(bd.final_price)}**")
+            else:
+                lines.append(f"> 价格 **{_fmt_price(bd.final_price)}**")
+            if self.savings > 0:
+                lines.append(f">")
+                lines.append(f"> 🎉 **比原品省 {_fmt_price(self.savings)}！**")
+            else:
+                lines.append(f">")
+                lines.append(f"> ✅ 原品已是最优价格")
+            lines.append("")
+
+        # ── 全网比价表格 ──
+        lines.append(f"## 🔍 全网同款比价（{len(self.cross_platform)} 件）")
+        lines.append("")
+        lines.append("| # | 平台 | 商品 | 原价 | 优惠券 | 到手价 | 备注 |")
+        lines.append("|---|------|------|------|--------|--------|------|")
+
         for i, p in enumerate(self.cross_platform[:10], 1):
-            tag = "🏆 全网最低" if i == 1 else ""
+            name = _PLATFORM_NAMES[p.platform]
+            emoji = _PLATFORM_EMOJI[p.platform]
+            tag = " 🏆" if i == 1 else ""
+            coupon = f"¥{p.coupon_amount:.0f}" if p.coupon_amount > 0 else "-"
+            title_short = _truncate(p.title, 25)
+
             is_source = (
                 p.platform.value == self.source_platform
                 and p.product_id == self.source_product_id
             )
-            source_mark = " ⭐ 原品" if is_source else ""
-            coupon_info = f"（券{p.coupon_amount:.0f}元）" if p.coupon_amount > 0 else ""
-            name = _PLATFORM_NAMES[p.platform]
+            note = "⭐原品" if is_source else ""
+
             lines.append(
-                f"{i}. [{name}] {p.title[:40]}… — ¥{p.final_price:.2f}{coupon_info}{source_mark} {tag}"
+                f"| {i} | {emoji} {name} | {title_short}{tag} | {_fmt_price(p.price)} | {coupon} | **{_fmt_price(p.final_price)}** | {note} |"
             )
 
-        if self.best_deal:
-            bd = self.best_deal
-            name = _PLATFORM_NAMES[bd.platform]
-            if self.savings > 0:
-                lines.append(
-                    f"\n💰 最优推荐: {name}「{bd.title[:30]}」¥{bd.final_price:.2f}"
-                    f"\n🎉 比原品省 ¥{self.savings:.2f}！"
-                )
-            else:
-                lines.append(f"\n✅ 原品已是最优价格，无需跨平台购买。")
         return "\n".join(lines)
