@@ -101,18 +101,20 @@ class JDEngine(BaseEngine):
         """检查京东联盟业务级错误。
 
         响应结构: {method}_responce → {code, message, result/queryResult}
+        京东外层 code: "0" 或 200 均表示调用成功。
         """
         resp_key = method.replace(".", "_") + "_responce"
         wrapper = resp.get(resp_key, resp)
 
         code = wrapper.get("code", 200)
-        if code == 200:
-            # 检查内层 result
+        # JD 返回 code="0"(字符串) 或 200(整数) 均为成功
+        if str(code) in ("0", "200"):
+            # 检查内层 result/queryResult
             try:
                 inner_str = wrapper.get("queryResult", wrapper.get("result", "{}"))
                 inner = json.loads(inner_str) if isinstance(inner_str, str) else inner_str
                 result_code = inner.get("code", 200)
-                if result_code != 200:
+                if str(result_code) not in ("0", "200"):
                     msg = inner.get("message", "")
                     self._classify_jd_error(str(result_code), msg)
             except (json.JSONDecodeError, TypeError, AttributeError):
