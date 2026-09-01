@@ -102,14 +102,28 @@ _RE_PDD_GOODS_ID = re.compile(r"goods_id[=:]\s*(\d+)", re.IGNORECASE)
 
 # ── 关键词提取 ────────────────────────────────────────────
 # 匹配常见分享文本中的商品名 (淘宝/京东/拼多多分享格式)
+# 注意: 先匹配最外层括号, 内层的 【营销标签】 在后处理中清洗
 _RE_KEYWORD_PATTERNS = [
-    # 【商品标题】或「商品标题」
-    re.compile(r"[【「]([^】」]{4,60})[】」]"),
-    # "商品标题" (引号包裹)
-    re.compile(r"[""「]([^""」]{4,60})[""」]"),
+    # 「商品标题」 — 优先中文书名号 (京东分享常用)
+    re.compile(r"[「]([^」]{4,80})[」]"),
+    # 【商品标题】 — 中文方括号
+    re.compile(r"[【]([^】]{4,80})[】]"),
+    # "商品标题" (引号包裹) — 使用 Unicode 避免编码歧义
+    re.compile(r"[\u201c\u201d]([^\u201c\u201d\u300d]{4,60})[\u201c\u201d]"),
     # 分享文本中 "我在xxx发现了..." 后面的内容
     re.compile(r"发现[了]?.*?[：:]?\s*(.{4,60}?)(?:[,，。]|https?|$)"),
 ]
+
+# 营销标签正则 — 匹配独立的【...】标签 (非商品名主体)
+_RE_MARKETING_TAG = re.compile(
+    r"【(?:顺丰包邮|支持[^】]{1,15}|新品|预售|现货|直邮|保税|正品|保证|"
+    r"限时|秒杀|特价|清仓|促销|热卖|爆款|网红|官方|自营|"
+    r"全国联保|含税|包税|免邮|加急|闪购|补贴|返利|优惠|"
+    r"AI|siri|Siri|SIRI)[^】]*】",
+    re.IGNORECASE,
+)
+# 清洗后的残留括号
+_RE_LEFTOVER_BRACKETS = re.compile(r"[【】「」\[\]（）\(\)]+")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -238,19 +252,86 @@ def extract_links(text: str) -> list[ParsedLink]:
 def _extract_keyword(text: str) -> str:
     """从分享文本中提取商品关键词。
 
-    尝试匹配常见分享格式中的商品标题，用于后续"找同款"搜索。
+    策略:
+    1. 匹配「...」(京东分享) — 内部清洗营销标签
+    2. 跳过纯营销标签的【...】，找商品主体的【...】
+    3. 匹配引号包裹的标题
+    4. 匹配 "发现" 格式
     """
-    for pattern in _RE_KEYWORD_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            kw = match.group(1).strip()
-            # 清理干扰词
-            for noise in ["点击链接", "打开淘宝", "打开京东", "打开拼多多", "立即抢购", "查看详情"]:
-                kw = kw.replace(noise, "")
-            kw = kw.strip()
-            if len(kw) >= 2:
-                return kw
+    # ── 1. 「...」格式 (京东分享) ──
+    m = re.search(r"[「]([^」]{4,80})[」]", text)
+    if m:
+        kw = _clean_keyword(m.group(1))
+        if kw and len(kw) >= 2:
+            return kw
+
+    # ── 2. 【...】格式 — 跳过营销标签，找商品主体 ──
+    for m in re.finditer(r"[【]([^】]{4,80})[】]", text):
+        candidate = m.group(1).strip()
+        # 检查是否是纯营销标签 (不含括号的原始内容)
+        if _is_marketing_tag_content(candidate):
+            continue
+        kw = _clean_keyword(candidate)
+        if kw and len(kw) >= 2:
+            return kw
+
+    # ── 2b. 如果所有【...】都是营销标签，尝试去除营销标签后的剩余文本 ──
+    cleaned = _RE_MARKETING_TAG.sub("", text)
+    cleaned = _RE_LEFTOVER_BRACKETS.sub(" ", cleaned)
+    # 提取有意义的文本片段 (至少包含一个中文或英文单词)
+    segments = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+)+", cleaned)
+    if segments:
+        # 过滤掉噪音词
+        noise_words = {"点击链接", "直接打开", "立即抢购", "查看详情", "京东", "淘宝", "拼多多"}
+        meaningful = [s.strip() for s in segments if s.strip() not in noise_words and len(s.strip()) >= 2]
+        if meaningful:
+            return " ".join(meaningful[:3])[:40]
+
+    # ── 3. 引号包裹的标题 ──
+    m = re.search(r"[\u201c\u201d]([^\u201c\u201d\u300d]{4,60})[\u201c\u201d]", text)
+    if m:
+        kw = _clean_keyword(m.group(1))
+        if kw and len(kw) >= 2:
+            return kw
+
+    # ── 4. "发现" 格式 ──
+    m = re.search(r"发现[了]?.*?[：:]?\s*(.{4,60}?)(?:[,，。]|https?|$)", text)
+    if m:
+        kw = _clean_keyword(m.group(1))
+        if kw and len(kw) >= 2:
+            return kw
+
     return ""
+
+
+def _is_marketing_tag_content(text: str) -> bool:
+    """判断【...】中的内容是否是纯营销标签 (非商品名)。"""
+    marketing_keywords = [
+        "顺丰包邮", "包邮", "现货", "预售", "直邮", "保税", "正品", "保证",
+        "限时", "秒杀", "特价", "清仓", "促销", "热卖", "爆款", "网红",
+        "官方", "自营", "全国联保", "含税", "包税", "免邮", "加急", "闪购",
+        "补贴", "返利", "优惠", "新品",
+    ]
+    text_lower = text.lower().strip()
+    # 匹配 "支持xxx" / "siri" / "AI" 等
+    if re.match(r"支持.{1,15}$", text_lower):
+        return True
+    if text_lower in ("ai", "siri", "google assistant"):
+        return True
+    for kw in marketing_keywords:
+        if kw in text:
+            return True
+    return False
+
+
+def _clean_keyword(text: str) -> str:
+    """清洗关键词文本: 去营销标签 + 残留括号 + 噪音词。"""
+    cleaned = _RE_MARKETING_TAG.sub("", text)
+    cleaned = _RE_LEFTOVER_BRACKETS.sub(" ", cleaned)
+    for noise in ["点击链接", "打开淘宝", "打开京东", "打开拼多多", "立即抢购", "查看详情"]:
+        cleaned = cleaned.replace(noise, "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def get_search_keyword(parsed: ParsedLink, original_title: str = "") -> str:
@@ -297,42 +378,92 @@ _SHORT_LINK_DOMAINS = (
 )
 
 
-async def resolve_short_link(url: str, *, timeout: float = 8.0) -> str | None:
-    """跟随 HTTP 重定向解析短链，返回最终落地页 URL。
+# 最大手动重定向次数
+_MAX_REDIRECTS = 10
 
-    返回 None 表示解析失败或超时。
+# 在 Location header 中匹配 SKU 的模式
+_RE_LOCATION_SKU = re.compile(
+    r"(?:item\.jd\.com|item\.jd\.hk|npcitem\.jd\.hk)[^\s]*?/(\d+)\.html",
+    re.IGNORECASE,
+)
+_RE_LOCATION_SKU_PARAM = re.compile(r"[?&](?:skuId|sku|wareId)=(\d+)")
+
+
+async def resolve_short_link(url: str, *, timeout: float = 8.0) -> tuple[str | None, str | None]:
+    """跟随 HTTP 重定向解析短链，返回 (最终落地页URL, 途中提取的SKU)。
+
+    手动跟随重定向以便在每一级 Location header 中嗅探 SKU。
+    返回 (None, None) 表示解析失败或超时。
     """
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-            "Mobile/15E148"
+            "Version/17.5 Mobile/15E148 Safari/604.1"
         ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
+    current_url = url
+    found_sku: str | None = None
+
     try:
         async with httpx.AsyncClient(
-            follow_redirects=True,
+            follow_redirects=False,  # 手动跟随，嗅探每级 Location
             timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
             headers=headers,
         ) as client:
-            resp = await client.get(url)
-            final_url = str(resp.url)
-            if final_url and final_url != url:
+            resp: httpx.Response | None = None
+            for _ in range(_MAX_REDIRECTS):
+                resp = await client.get(current_url)
+
+                # 检查是否有重定向
+                location = resp.headers.get("location", "")
+                if location:
+                    # 补全相对路径
+                    if location.startswith("/"):
+                        parsed_url = httpx.URL(current_url)
+                        location = f"{parsed_url.scheme}://{parsed_url.host}{location}"
+                    elif not location.startswith("http"):
+                        location = f"https://{location}"
+
+                    # 在 Location 中嗅探 SKU
+                    if not found_sku:
+                        sku = extract_sku_from_url(location)
+                        if sku:
+                            found_sku = sku
+                            logger.info("Location 嗅探到 SKU: %s (from %s)", sku, location[:80])
+
+                    current_url = location
+                    continue
+
+                # 没有重定向，到达最终页面
+                break
+
+            final_url = current_url
+            if final_url != url:
                 logger.info("短链解析: %s → %s", url, final_url)
-                return final_url
-            # 有些短链不重定向但返回 HTML 里有跳转
-            if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", ""):
-                # 尝试从 HTML meta refresh 或 JS 跳转提取
+
+            # 如果还没找到 SKU，从最终 URL 提取
+            if not found_sku:
+                found_sku = extract_sku_from_url(final_url)
+
+            # 尝试从 HTML meta refresh 提取
+            if resp is not None and resp.status_code == 200 and "text/html" in resp.headers.get("content-type", ""):
                 text = resp.text[:5000]
                 meta_refresh = re.search(
                     r'url=["\']?(https?://[^"\'>\s]+)', text, re.IGNORECASE,
                 )
                 if meta_refresh:
-                    return meta_refresh.group(1)
-            return final_url if final_url != url else None
+                    meta_url = meta_refresh.group(1)
+                    if not found_sku:
+                        found_sku = extract_sku_from_url(meta_url)
+                    return meta_url, found_sku
+
+            return (final_url if final_url != url else None, found_sku)
     except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
         logger.warning("短链解析失败 %s: %s", url, e)
-        return None
+        return None, None
 
 
 async def extract_title_from_url(url: str, *, timeout: float = 8.0) -> str:
@@ -409,6 +540,23 @@ def extract_sku_from_url(url: str) -> str | None:
     return None
 
 
+def _clean_title(title: str) -> str:
+    """清洗商品标题中的营销标签，提取核心商品名。
+
+    例: "【顺丰包邮】【支持Siri AI】Apple/苹果 iPhone 17 Pro Max 美版"
+    → "Apple/苹果 iPhone 17 Pro Max 美版"
+    """
+    # 先去除营销标签
+    cleaned = _RE_MARKETING_TAG.sub("", title)
+    # 清理残留括号
+    cleaned = _RE_LEFTOVER_BRACKETS.sub(" ", cleaned)
+    # 去除常见后缀
+    for suffix in ["-京东", "-JD.COM", "｜京东", "|京东", "-淘宝", "-天猫", "【自营】"]:
+        cleaned = cleaned.replace(suffix, "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:60] if cleaned else title[:60]
+
+
 async def resolve_and_enrich(parsed: ParsedLink) -> ParsedLink:
     """解析短链并丰富元数据: 重定向 → 提取 SKU → 提取标题关键词。
 
@@ -422,27 +570,25 @@ async def resolve_and_enrich(parsed: ParsedLink) -> ParsedLink:
     if not url.startswith("http"):
         url = f"https://{url}"
 
-    # 1. 跟随重定向
-    final_url = await resolve_short_link(url)
+    # 1. 跟随重定向 + Location 嗅探 SKU
+    final_url, location_sku = await resolve_short_link(url)
+
     if final_url:
         parsed.raw_url = final_url
 
-        # 2. 从最终 URL 提取 SKU
+    # 2. 优先使用 Location 嗅探到的 SKU，其次从最终 URL 提取
+    sku = location_sku
+    if not sku and final_url:
         sku = extract_sku_from_url(final_url)
-        if sku:
-            parsed.item_id = sku
-            parsed.item_type = ItemType.PRODUCT_ID
-            parsed.confidence = 0.95
+    if sku:
+        parsed.item_id = sku
+        parsed.item_type = ItemType.PRODUCT_ID
+        parsed.confidence = 0.95
 
-        # 3. 如果没有关键词，尝试从落地页提取标题
-        if not parsed.keyword:
-            title = await extract_title_from_url(final_url)
-            if title:
-                # 清洗标题，提取核心词
-                clean = title
-                for ch in "【】「」*#|｜":
-                    clean = clean.replace(ch, "")
-                clean = clean.strip()
-                parsed.keyword = clean[:40]
+    # 3. 如果没有关键词，尝试从落地页提取标题
+    if not parsed.keyword and final_url:
+        title = await extract_title_from_url(final_url)
+        if title:
+            parsed.keyword = _clean_title(title)
 
     return parsed

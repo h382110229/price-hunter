@@ -473,3 +473,97 @@ class TestTitleSimilarity:
         filtered = _filter_by_relevance(products, "", "蓝牙耳机")
         assert len(filtered) == 1
         assert "蓝牙" in filtered[0].title or "耳机" in filtered[0].title
+
+
+# ═══════════════════════════════════════════════════════════
+# 10. 营销标签清洗
+# ═══════════════════════════════════════════════════════════
+
+class TestMarketingTagCleaning:
+    """营销标签清洗与关键词提取"""
+
+    def test_nested_brackets_jd_share(self):
+        """京东分享: 「【支持siri AI】iPhone17PM 美版」→ iPhone17PM 美版"""
+        text = "【京东】https://3.jd.hk/-102POe0 「【支持siri AI】iPhone17PM 美版」点击链接"
+        kw = extract_links(text)[0].keyword
+        # 营销标签应被清洗，保留商品主体名
+        assert "iPhone" in kw or "17PM" in kw or "美版" in kw
+        assert "siri" not in kw.lower()
+        assert "【" not in kw
+
+    def test_marketing_tags_stripped(self):
+        """【顺丰包邮】【支持Siri AI】Apple/苹果 iPhone 17 Pro Max 美版"""
+        text = "【顺丰包邮】【支持Siri AI】Apple/苹果 iPhone 17 Pro Max 美版 https://item.jd.com/123.html"
+        results = extract_links(text)
+        kw = results[0].keyword
+        assert "顺丰" not in kw
+        assert "Siri" not in kw
+        assert "Apple" in kw or "iPhone" in kw or "Pro Max" in kw
+
+    def test_simple_bracket_title(self):
+        """简单【商品名】不被过度清洗"""
+        text = "【索尼WH-1000XM5头戴式降噪耳机】限时特惠 ￥AbCd123￥"
+        results = extract_links(text)
+        assert "索尼" in results[0].keyword or "耳机" in results[0].keyword
+
+    def test_clean_title_function(self):
+        """_clean_title 营销标签清洗"""
+        from src.parsers.link_extractor import _clean_title
+        assert "Apple" in _clean_title("【顺丰包邮】【支持Siri AI】Apple/苹果 iPhone 17 Pro Max 美版")
+        assert "顺丰" not in _clean_title("【顺丰包邮】【支持Siri AI】Apple/苹果 iPhone 17 Pro Max 美版")
+        assert _clean_title("-京东").strip() == "-京东" or _clean_title("-京东") == ""
+
+    def test_marketing_tag_regex(self):
+        """营销标签正则匹配"""
+        from src.parsers.link_extractor import _RE_MARKETING_TAG
+        assert _RE_MARKETING_TAG.sub("", "【支持siri AI】iPhone17PM").strip() == "iPhone17PM"
+        assert _RE_MARKETING_TAG.sub("", "【顺丰包邮】耳机").strip() == "耳机"
+        assert _RE_MARKETING_TAG.sub("", "【现货】手机壳").strip() == "手机壳"
+        # 非营销标签不应被删除
+        assert _RE_MARKETING_TAG.sub("", "【索尼降噪耳机】") == "【索尼降噪耳机】"
+
+
+# ═══════════════════════════════════════════════════════════
+# 11. Location 嗅探 Mock 测试
+# ═══════════════════════════════════════════════════════════
+
+class TestLocationSniffing:
+    """短链 Location header SKU 嗅探"""
+
+    def test_extract_sku_from_location_url(self):
+        """从 Location URL 提取 SKU"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        # 京东国际重定向目标
+        assert extract_sku_from_url("https://item.jd.hk/1008611040.html") == "1008611040"
+        # 带 skuId 参数
+        assert extract_sku_from_url("https://item.jd.com/?skuId=998877") == "998877"
+        # 拼多多
+        assert extract_sku_from_url("https://mobile.yangkeduo.com/goods.html?goods_id=12345") == "12345"
+
+    @pytest.mark.asyncio
+    async def test_resolve_short_link_returns_tuple(self):
+        """resolve_short_link 返回 (url, sku) 元组"""
+        from src.parsers.link_extractor import resolve_short_link
+        # 用一个不存在的 URL 测试错误处理
+        result = await resolve_short_link("https://3.jd.hk/this-does-not-exist-abc123", timeout=3.0)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_resolve_and_enrich_with_real_3jdhk(self):
+        """真实 3.jd.hk 短链 → 验证 Location 嗅探"""
+        from src.parsers.link_extractor import resolve_and_enrich
+        parsed = ParsedLink(
+            platform=Platform.JD,
+            item_type=ItemType.SHORT_LINK,
+            item_id="https://3.jd.hk/-102POe0",
+            raw_url="https://3.jd.hk/-102POe0",
+            keyword="iPhone17PM 美版",
+        )
+        result = await resolve_and_enrich(parsed)
+        # 无论是否解析成功，keyword 应保留
+        assert result.keyword != ""
+        # 如果解析成功，item_id 应该是 SKU 数字
+        if result.item_type == ItemType.PRODUCT_ID:
+            assert result.item_id.isdigit()
+            assert result.confidence == 0.95
