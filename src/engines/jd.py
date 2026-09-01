@@ -201,40 +201,48 @@ class JDEngine(BaseEngine):
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
         """京粉精选商品搜索 (jd.union.open.goods.jingfen.query)
 
-        eliteId: 1=好券商品, 22=实时热销榜
-        客户端关键词过滤: 从精选池中匹配标题。
+        尝试多个 eliteId 池以扩大覆盖面:
+        - 1: 好券商品
+        - 22: 实时热销榜
+        - 24: 数码家电
+        客户端关键词过滤: 从合并池中匹配标题。
         """
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
 
+        # 多个精英池并发请求
+        elite_ids = [1, 22, 24]
         fetch_size = min(page_size * _OVERFETCH_MULTIPLIER, 50)
-        biz_params = {
-            "goodsReq": {
-                "eliteId": 1,
-                "pageIndex": page,
-                "pageSize": fetch_size,
-                "sortName": "price",
-                "sort": "asc",
+
+        async def _fetch_pool(elite_id: int) -> list[Product]:
+            biz_params = {
+                "goodsReq": {
+                    "eliteId": elite_id,
+                    "pageIndex": page,
+                    "pageSize": fetch_size,
+                    "sortName": "price",
+                    "sort": "asc",
+                }
             }
-        }
-        try:
-            resp = await self._jd_request("jd.union.open.goods.jingfen.query", biz_params)
-        except JDPermissionDenied:
-            return []
-        except ApiBusinessError as e:
-            # 400 参数错误等 — 记录 warning 但不崩溃
-            logger.warning("🟡 JD jingfen.query 失败: %s", e)
-            return []
-        try:
-            result = resp.get("jd_union_open_goods_jingfen_query_responce", {})
-            data = json.loads(result.get("queryResult", "{}"))
-            items = data.get("data", [])
-            all_products = [self._parse_product(item) for item in items]
-            filtered = self._filter_by_keyword(all_products, keyword)
-            return filtered[:page_size]
-        except (KeyError, TypeError, json.JSONDecodeError) as e:
-            logger.warning("京东京粉搜索解析失败: %s", e)
-            return []
+            try:
+                resp = await self._jd_request("jd.union.open.goods.jingfen.query", biz_params)
+                result = resp.get("jd_union_open_goods_jingfen_query_responce", {})
+                data = json.loads(result.get("queryResult", "{}"))
+                items = data.get("data", [])
+                return [self._parse_product(item) for item in items]
+            except JDPermissionDenied:
+                return []
+            except ApiBusinessError as e:
+                logger.warning("🟡 JD jingfen.query eliteId=%d 失败: %s", elite_id, e)
+                return []
+
+        import asyncio
+        pools = await asyncio.gather(*[_fetch_pool(eid) for eid in elite_ids])
+        all_products = [p for pool in pools for p in pool]
+
+        # 客户端关键词过滤
+        filtered = self._filter_by_keyword(all_products, keyword)
+        return filtered[:page_size]
 
     async def detail(self, product_id: str) -> Product:
         if self.dry_run:

@@ -257,20 +257,45 @@ class PDDEngine(BaseEngine):
         return matched
 
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
-        """获取推荐商品，支持客户端关键词过滤。
+        """关键词搜索: 优先 goods.search, 降级 recommend.get。
 
-        PDD 已下线 goods.search 接口，使用 recommend.get 替代。
-        客户端从推荐池中按标题匹配关键词，确保返回相关商品。
+        goods.search 支持服务端关键词匹配 (更精准),
+        recommend.get 仅返回推荐池 + 客户端过滤 (覆盖面窄)。
         """
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
 
-        offset = (page - 1) * page_size
-        # 多拉一些用于过滤后仍有足够结果
-        fetch_size = page_size * self._OVERFETCH_MULTIPLIER
-        fetch_size = min(fetch_size, 100)  # API 上限 100
+        # ── 1. 优先 goods.search (服务端关键词搜索) ──
+        if keyword:
+            products = await self._search_by_keyword(keyword, page, page_size)
+            if products:
+                return products
 
-        # 不传 pid 和 channel_type — 都会触发授权备案检查
+        # ── 2. 降级 recommend.get (推荐池 + 客户端过滤) ──
+        return await self._search_by_recommend(keyword, page, page_size)
+
+    async def _search_by_keyword(self, keyword: str, page: int, page_size: int) -> list[Product]:
+        """通过 goods.search 做服务端关键词搜索。"""
+        resp = await self._pdd_request("pdd.ddk.goods.search", {
+            "goods_search_request": {
+                "keyword": keyword,
+                "page": page,
+                "page_size": min(page_size * self._OVERFETCH_MULTIPLIER, 100),
+            },
+        })
+        try:
+            wrapper = resp.get("goods_search_response", {})
+            items = wrapper.get("goods_list", [])
+            return [self._parse_recommend_item(item) for item in items[:page_size]]
+        except (KeyError, TypeError) as e:
+            logger.warning("拼多多 goods.search 解析失败: %s", e)
+            return []
+
+    async def _search_by_recommend(self, keyword: str, page: int, page_size: int) -> list[Product]:
+        """通过 recommend.get 获取推荐池 + 客户端关键词过滤。"""
+        offset = (page - 1) * page_size
+        fetch_size = min(page_size * self._OVERFETCH_MULTIPLIER, 100)
+
         resp = await self._pdd_request("pdd.ddk.goods.recommend.get", {
             "offset": offset,
             "limit": fetch_size,
@@ -279,11 +304,7 @@ class PDDEngine(BaseEngine):
             result = resp.get("goods_basic_detail_response", {})
             items = result.get("list", [])
             all_products = [self._parse_recommend_item(item) for item in items]
-
-            # 客户端关键词过滤
             filtered = self._filter_by_keyword(all_products, keyword)
-
-            # 返回 page_size 个结果
             return filtered[:page_size]
         except (KeyError, TypeError) as e:
             logger.warning("拼多多推荐解析失败: %s", e)

@@ -389,7 +389,7 @@ _RE_LOCATION_SKU = re.compile(
 _RE_LOCATION_SKU_PARAM = re.compile(r"[?&](?:skuId|sku|wareId)=(\d+)")
 
 
-async def resolve_short_link(url: str, *, timeout: float = 8.0) -> tuple[str | None, str | None]:
+async def resolve_short_link(url: str, *, timeout: float = 15.0) -> tuple[str | None, str | None]:
     """跟随 HTTP 重定向解析短链，返回 (最终落地页URL, 途中提取的SKU)。
 
     手动跟随重定向以便在每一级 Location header 中嗅探 SKU。
@@ -412,6 +412,7 @@ async def resolve_short_link(url: str, *, timeout: float = 8.0) -> tuple[str | N
             follow_redirects=False,  # 手动跟随，嗅探每级 Location
             timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
             headers=headers,
+            trust_env=False,  # 跳过 HTTP_PROXY 环境变量，避免双重代理 (TUN + HTTP proxy)
         ) as client:
             resp: httpx.Response | None = None
             for _ in range(_MAX_REDIRECTS):
@@ -466,7 +467,7 @@ async def resolve_short_link(url: str, *, timeout: float = 8.0) -> tuple[str | N
         return None, None
 
 
-async def extract_title_from_url(url: str, *, timeout: float = 8.0) -> str:
+async def extract_title_from_url(url: str, *, timeout: float = 15.0) -> str:
     """从落地页 HTML 中提取商品标题。
 
     尝试顺序: og:title > <title>。返回空字符串表示失败。
@@ -483,6 +484,7 @@ async def extract_title_from_url(url: str, *, timeout: float = 8.0) -> str:
             follow_redirects=True,
             timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
             headers=headers,
+            trust_env=False,
         ) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
@@ -522,9 +524,11 @@ def extract_sku_from_url(url: str) -> str | None:
     jd_param = re.search(r"[?&](?:skuId|sku|wareId)=(\d+)", url)
     if jd_param:
         return jd_param.group(1)
-    # 京东 — 路径中的 SKU (直接跟在域名后的数字)
+    # 京东 — 路径中的 SKU: item.jd.com/123.html, item.jd.hk/123.html,
+    #   npcitem.jd.hk/123.html, mitem.jd.hk/product/123.html
     jd_path = re.search(
-        r"(?:item\.jd\.com|item\.jd\.hk|npcitem\.jd\.hk)/(\d+)\.html",
+        r"(?:item\.jd\.com|item\.jd\.hk|npcitem\.jd\.hk|mitem\.jd\.hk)"
+        r"(?:/product)?/(\d+)\.html",
         url, re.IGNORECASE,
     )
     if jd_path:
