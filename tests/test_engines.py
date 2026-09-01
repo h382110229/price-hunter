@@ -240,6 +240,137 @@ class TestJDEngineDryRun:
             assert len(coupons) > 0
 
 
+class TestJDSigning:
+    """京东联盟签名单元测试"""
+
+    def test_jd_sign_basic(self):
+        """基本签名: MD5(secret + sorted_kv + secret).upper()"""
+        from src.engines.jd import jd_sign
+        params = {
+            "method": "jd.union.open.goods.query",
+            "app_key": "test_key",
+            "timestamp": "2026-08-31 12:00:00",
+        }
+        secret = "test_secret"
+        result = jd_sign(params, secret)
+        assert len(result) == 32
+        assert result == result.upper()
+
+    def test_jd_sign_deterministic(self):
+        """相同输入 → 相同签名"""
+        from src.engines.jd import jd_sign
+        params = {"a": "1", "b": "2"}
+        assert jd_sign(params, "sec") == jd_sign(params, "sec")
+
+    def test_jd_sign_order_independent(self):
+        """参数顺序不影响签名"""
+        from src.engines.jd import jd_sign
+        p1 = {"b": "2", "a": "1"}
+        p2 = {"a": "1", "b": "2"}
+        assert jd_sign(p1, "sec") == jd_sign(p2, "sec")
+
+    def test_jd_sign_includes_param_json(self):
+        """签名包含 param_json 字段"""
+        from src.engines.jd import jd_sign
+        import json
+        pj = json.dumps({"goodsReqDTO": {"keyword": "test"}}, separators=(",", ":"))
+        params = {
+            "method": "jd.union.open.goods.query",
+            "app_key": "key",
+            "param_json": pj,
+            "timestamp": "2026-08-31 12:00:00",
+        }
+        result = jd_sign(params, "secret")
+        assert len(result) == 32
+
+    def test_jd_sign_known_vector(self):
+        """已知向量验算"""
+        from src.engines.jd import jd_sign
+        import hashlib
+        params = {"method": "test", "app_key": "key"}
+        secret = "sec"
+        sorted_kv = "app_keykeymethodtest"
+        expected = hashlib.md5((secret + sorted_kv + secret).encode()).hexdigest().upper()
+        assert jd_sign(params, secret) == expected
+
+
+class TestJDProductParsing:
+    """京东商品解析回归测试"""
+
+    def _make_engine(self):
+        return JDEngine()
+
+    def test_price_parsing(self):
+        """priceInfo.price 正确解析"""
+        engine = self._make_engine()
+        item = {"skuId": "123", "skuName": "测试", "priceInfo": {"price": 299.9}}
+        p = engine._parse_product(item)
+        assert p.price == 299.9
+
+    def test_best_coupon_extraction(self):
+        """提取最大面额优惠券"""
+        engine = self._make_engine()
+        item = {
+            "skuId": "123", "skuName": "测试", "priceInfo": {"price": 100},
+            "couponInfo": {"couponList": [
+                {"couponId": "1", "discount": 10, "quota": 99, "link": ""},
+                {"couponId": "2", "discount": 30, "quota": 99, "link": ""},
+                {"couponId": "3", "discount": 20, "quota": 99, "link": ""},
+            ]},
+        }
+        p = engine._parse_product(item)
+        assert p.coupon_amount == 30.0
+        assert p.final_price == 70.0
+        assert p.coupons[0].coupon_id == "2"
+
+    def test_no_coupon(self):
+        """无优惠券时 final_price = price"""
+        engine = self._make_engine()
+        item = {"skuId": "123", "skuName": "测试", "priceInfo": {"price": 50},
+                "couponInfo": {"couponList": []}}
+        p = engine._parse_product(item)
+        assert p.coupon_amount == 0.0
+        assert p.final_price == 50.0
+
+    def test_commission_rate(self):
+        """佣金比例正确解析"""
+        engine = self._make_engine()
+        item = {"skuId": "123", "skuName": "测试", "priceInfo": {"price": 100},
+                "commissionInfo": {"commissionShare": 15.5}}
+        p = engine._parse_product(item)
+        assert p.commission_rate == 15.5
+
+    def test_sales_volume(self):
+        """30天引单数正确解析"""
+        engine = self._make_engine()
+        item = {"skuId": "123", "skuName": "测试", "priceInfo": {"price": 100},
+                "inOrderCount30Days": 5895}
+        p = engine._parse_product(item)
+        assert p.sales_volume == 5895
+
+    def test_image_url(self):
+        """图片从 imageInfo.imageList[0].url 提取"""
+        engine = self._make_engine()
+        item = {"skuId": "123", "skuName": "测试", "priceInfo": {"price": 100},
+                "imageInfo": {"imageList": [{"url": "https://img.jd.com/1.jpg"}]}}
+        p = engine._parse_product(item)
+        assert p.image_url == "https://img.jd.com/1.jpg"
+
+    def test_detail_url_format(self):
+        """详情页 URL 格式: item.jd.com/{skuId}.html"""
+        engine = self._make_engine()
+        item = {"skuId": "99887766", "skuName": "测试", "priceInfo": {"price": 100}}
+        p = engine._parse_product(item)
+        assert p.detail_url == "https://item.jd.com/99887766.html"
+
+    def test_promotion_url_mock(self):
+        """Dry-run 模式转链返回 mock URL"""
+        engine = self._make_engine()
+        import asyncio
+        url = asyncio.run(engine.get_promotion_url("https://item.jd.com/123.html"))
+        assert "u.jd.com" in url
+
+
 class TestPDDEngineDryRun:
     """拼多多引擎 Dry-run 模式"""
 
