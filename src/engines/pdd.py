@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 from src.config import settings as _cfg
@@ -36,15 +37,67 @@ _PDD_SIGN_ERRORS = {10019, 10020}
 _PDD_AUTH_ERRORS = {10001, 10002}
 
 
+def _tokenize_chinese(text: str) -> list[str]:
+    """简易中文分词: 按非中文字符切分 + 2-gram 滑窗。
+
+    用于客户端关键词匹配，不需要完整 NLP 分词。
+    """
+    # 提取中文片段和英文单词
+    tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", text)
+    result: list[str] = []
+    for tok in tokens:
+        result.append(tok)
+        # 中文 2-gram
+        if len(tok) >= 2 and re.match(r"[\u4e00-\u9fff]", tok):
+            for i in range(len(tok) - 1):
+                result.append(tok[i : i + 2])
+    return result
+
+
+def _keyword_match_score(title: str, keyword: str) -> float:
+    """计算商品标题与关键词的匹配分数。
+
+    - 完整包含关键词 → 1.0
+    - 包含关键词的分词片段 → 按命中比例加分
+    - 不匹配 → 0.0
+    """
+    if not keyword:
+        return 1.0  # 无关键词时全部通过
+
+    title_lower = title.lower()
+    kw_lower = keyword.lower()
+
+    # 完整包含 → 满分
+    if kw_lower in title_lower:
+        return 1.0
+
+    # 分词匹配
+    kw_tokens = _tokenize_chinese(keyword)
+    if not kw_tokens:
+        return 1.0
+
+    matched = sum(1 for t in kw_tokens if t.lower() in title_lower)
+    score = matched / len(kw_tokens)
+
+    # 至少命中 30% 的 token 才算有效匹配
+    return score if score >= 0.3 else 0.0
+
+
 class PDDEngine(BaseEngine):
     """多多进宝搜索引擎
 
     使用 pdd.ddk.goods.recommend.get 接口获取商品 (免费，不需要用户授权)。
     默认返回 channel_type=5 (实时热销榜)。
+    支持客户端关键词过滤: 从推荐池中匹配标题包含关键词的商品。
     """
 
     platform = Platform.PDD
     base_url = "https://gw-api.pinduoduo.com/api/router"
+
+    # 客户端过滤阈值: 至少保留这么多个匹配结果
+    _MIN_KEYWORD_MATCHES = 3
+    # 获取推荐池时多拉一些，用于过滤后仍有足够结果
+    _OVERFETCH_MULTIPLIER = 3
 
     def __init__(self) -> None:
         super().__init__(_cfg.pdd_client_id, _cfg.pdd_client_secret)
@@ -111,14 +164,17 @@ class PDDEngine(BaseEngine):
         - extra_coupon_amount: 分 → 元 (÷100)
         - coupon_min_order_amount: 分 → 元 (÷100)
         - promotion_rate: 千分比 → 百分比 (÷10)
+
+        优惠券计算: 取 coupon_discount 和 extra_coupon_amount 的较大值，避免重叠。
         """
         # 价格
         min_group_price = float(item.get("min_group_price", 0))
         price = min_group_price / 100.0
 
-        # 优惠券 (extra_coupon_amount 可能与 coupon_discount 重叠，不累加)
+        # 优惠券: 取两者较大值，避免重叠
         coupon_discount = float(item.get("coupon_discount", 0))
-        coupon_amount = coupon_discount / 100.0
+        extra_coupon = float(item.get("extra_coupon_amount", 0))
+        coupon_amount = max(coupon_discount, extra_coupon) / 100.0
 
         final_price = max(0.0, price - coupon_amount)
 
@@ -132,11 +188,14 @@ class PDDEngine(BaseEngine):
         product_id = goods_sign or goods_id
         detail_url = f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}"
 
-        # 销量 (字符串类型，如 "1.2万")
+        # 销量 (字符串类型，如 "1.2万", "5895")
         sales = item.get("sales_tip", item.get("realtime_sales_tip", "0"))
         try:
-            sales_str = str(sales).replace("+", "").replace("万", "0000")
-            sales_int = int(float(sales_str))
+            sales_str = str(sales).replace("+", "")
+            if "万" in sales_str:
+                sales_int = int(float(sales_str.replace("万", "")) * 10000)
+            else:
+                sales_int = int(float(sales_str))
         except (ValueError, TypeError):
             sales_int = 0
 
@@ -170,26 +229,66 @@ class PDDEngine(BaseEngine):
             coupons=coupons,
         )
 
+    def _filter_by_keyword(self, products: list[Product], keyword: str) -> list[Product]:
+        """客户端关键词过滤: 从推荐池中筛选标题匹配的商品。
+
+        策略:
+        1. 按匹配分数排序 (高分在前)
+        2. 保留所有分数 > 0 的结果
+        3. 如果匹配数不足 _MIN_KEYWORD_MATCHES，补充未匹配的热门商品
+        """
+        if not keyword:
+            return products
+
+        scored = [
+            (p, _keyword_match_score(p.title, keyword))
+            for p in products
+        ]
+
+        matched = [p for p, score in scored if score > 0]
+        unmatched = [p for p, score in scored if score == 0]
+
+        # 按匹配分数降序排列 matched
+        matched.sort(
+            key=lambda p: _keyword_match_score(p.title, keyword),
+            reverse=True,
+        )
+
+        # 如果匹配数不足，补充热门商品
+        if len(matched) < self._MIN_KEYWORD_MATCHES:
+            matched.extend(unmatched[: self._MIN_KEYWORD_MATCHES - len(matched)])
+
+        return matched if matched else products
+
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
-        """获取推荐商品。
+        """获取推荐商品，支持客户端关键词过滤。
 
         PDD 已下线 goods.search 接口，使用 recommend.get 替代。
-        默认返回 channel_type=5 (实时热销榜)。
-        keyword 参数当前无法直接用于搜索 (API 限制)。
+        客户端从推荐池中按标题匹配关键词，确保返回相关商品。
         """
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
 
         offset = (page - 1) * page_size
+        # 多拉一些用于过滤后仍有足够结果
+        fetch_size = page_size * self._OVERFETCH_MULTIPLIER
+        fetch_size = min(fetch_size, 100)  # API 上限 100
+
         # 不传 pid 和 channel_type — 都会触发授权备案检查
         resp = await self._pdd_request("pdd.ddk.goods.recommend.get", {
             "offset": offset,
-            "limit": page_size,
+            "limit": fetch_size,
         })
         try:
             result = resp.get("goods_basic_detail_response", {})
             items = result.get("list", [])
-            return [self._parse_recommend_item(item) for item in items]
+            all_products = [self._parse_recommend_item(item) for item in items]
+
+            # 客户端关键词过滤
+            filtered = self._filter_by_keyword(all_products, keyword)
+
+            # 返回 page_size 个结果
+            return filtered[:page_size]
         except (KeyError, TypeError) as e:
             logger.warning("拼多多推荐解析失败: %s", e)
             return []

@@ -266,6 +266,169 @@ class TestPDDEngineDryRun:
 
 
 # ═══════════════════════════════════════════════════════════
+# 3b. PDD 引擎回归测试 (单元转换、优惠券、关键词过滤)
+# ═══════════════════════════════════════════════════════════
+
+class TestPDDUnitConversion:
+    """PDD 价格单位转换与优惠券计算"""
+
+    def _make_engine(self):
+        """创建 dry_run 引擎 (不触发真实 API)"""
+        return PDDEngine()
+
+    def test_price_fen_to_yuan(self):
+        """min_group_price 分 → 元"""
+        engine = self._make_engine()
+        item = {"min_group_price": 37200, "coupon_discount": 0, "goods_name": "测试"}
+        p = engine._parse_recommend_item(item)
+        assert p.price == 372.0
+
+    def test_coupon_fen_to_yuan(self):
+        """coupon_discount 分 → 元"""
+        engine = self._make_engine()
+        item = {"min_group_price": 10000, "coupon_discount": 3000, "goods_name": "测试"}
+        p = engine._parse_recommend_item(item)
+        assert p.coupon_amount == 30.0
+        assert p.final_price == 70.0
+
+    def test_coupon_max_no_overlap(self):
+        """优惠券取 max(coupon_discount, extra_coupon_amount)，不累加"""
+        engine = self._make_engine()
+        item = {
+            "min_group_price": 10000,
+            "coupon_discount": 3000,  # 30元
+            "extra_coupon_amount": 5000,  # 50元
+            "goods_name": "测试",
+        }
+        p = engine._parse_recommend_item(item)
+        # 应取 max(30, 50) = 50，而不是 30+50=80
+        assert p.coupon_amount == 50.0
+        assert p.final_price == 50.0
+
+    def test_coupon_only_extra(self):
+        """仅有 extra_coupon_amount 时也能正确计算"""
+        engine = self._make_engine()
+        item = {
+            "min_group_price": 10000,
+            "coupon_discount": 0,
+            "extra_coupon_amount": 2000,
+            "goods_name": "测试",
+        }
+        p = engine._parse_recommend_item(item)
+        assert p.coupon_amount == 20.0
+
+    def test_commission_permille_to_percent(self):
+        """promotion_rate 千分比 → 百分比"""
+        engine = self._make_engine()
+        item = {"min_group_price": 10000, "promotion_rate": 90, "goods_name": "测试"}
+        p = engine._parse_recommend_item(item)
+        assert p.commission_rate == 9.0  # 90‰ = 9%
+
+    def test_goods_sign_as_product_id(self):
+        """product_id 优先使用 goods_sign"""
+        engine = self._make_engine()
+        item = {
+            "goods_id": 123456,
+            "goods_sign": "ABC123_sign",
+            "min_group_price": 10000,
+            "goods_name": "测试",
+        }
+        p = engine._parse_recommend_item(item)
+        assert p.product_id == "ABC123_sign"
+
+    def test_sales_tip_wan(self):
+        """销量 "1.2万" → 12000"""
+        engine = self._make_engine()
+        item = {"min_group_price": 10000, "sales_tip": "1.2万", "goods_name": "测试"}
+        p = engine._parse_recommend_item(item)
+        assert p.sales_volume == 12000
+
+    def test_sales_tip_plain_number(self):
+        """销量 "5895" → 5895"""
+        engine = self._make_engine()
+        item = {"min_group_price": 10000, "sales_tip": "5895", "goods_name": "测试"}
+        p = engine._parse_recommend_item(item)
+        assert p.sales_volume == 5895
+
+    def test_final_price_no_negative(self):
+        """券后价不低于 0"""
+        engine = self._make_engine()
+        item = {"min_group_price": 500, "coupon_discount": 1000, "goods_name": "测试"}
+        p = engine._parse_recommend_item(item)
+        assert p.final_price == 0.0
+
+
+class TestPDDKeywordFilter:
+    """PDD 客户端关键词过滤"""
+
+    def _make_engine(self):
+        return PDDEngine()
+
+    def _make_product(self, title: str) -> Product:
+        return Product(
+            platform=Platform.PDD, product_id="test", title=title,
+            price=10.0, coupon_amount=0.0, final_price=10.0,
+        )
+
+    def test_exact_match(self):
+        """完整关键词包含 → 排在前面"""
+        engine = self._make_engine()
+        products = [
+            self._make_product("维达抽纸家用实惠装整箱"),
+            self._make_product("金纺柔顺剂薰衣草"),
+            self._make_product("洗衣液大桶装"),
+            self._make_product("纸巾抽纸面巾纸"),
+        ]
+        result = engine._filter_by_keyword(products, "抽纸")
+        # 匹配项应排在前面
+        assert "抽纸" in result[0].title
+        assert "抽纸" in result[1].title
+
+    def test_partial_match(self):
+        """部分分词匹配 → 保留"""
+        engine = self._make_engine()
+        products = [
+            self._make_product("无线蓝牙耳机降噪运动"),
+            self._make_product("有线耳机入耳式重低音"),
+            self._make_product("洗衣液大桶装家庭用"),
+        ]
+        result = engine._filter_by_keyword(products, "蓝牙耳机")
+        # 至少 "无线蓝牙耳机降噪运动" 应该匹配
+        assert any("蓝牙" in p.title for p in result)
+
+    def test_no_match_fallback(self):
+        """无匹配时补充热门商品"""
+        engine = self._make_engine()
+        products = [
+            self._make_product("苹果iPhone手机壳"),
+            self._make_product("华为Mate手机壳"),
+            self._make_product("洗衣液"),
+        ]
+        result = engine._filter_by_keyword(products, "耳机")
+        # 无匹配，应补充热门商品
+        assert len(result) >= 1
+
+    def test_empty_keyword(self):
+        """空关键词 → 全部通过"""
+        engine = self._make_engine()
+        products = [self._make_product("A"), self._make_product("B")]
+        result = engine._filter_by_keyword(products, "")
+        assert len(result) == 2
+
+    def test_match_score_ordering(self):
+        """匹配结果按分数排序"""
+        engine = self._make_engine()
+        products = [
+            self._make_product("洗衣液大桶装"),  # 不匹配 "抽纸"
+            self._make_product("维达抽纸家用实惠装整箱抽纸批发"),  # 强匹配
+            self._make_product("纸巾抽纸面巾纸"),  # 中等匹配
+        ]
+        result = engine._filter_by_keyword(products, "抽纸")
+        # 第一个应该是匹配度最高的
+        assert "抽纸" in result[0].title
+
+
+# ═══════════════════════════════════════════════════════════
 # 4. 跨平台比价排序测试
 # ═══════════════════════════════════════════════════════════
 
