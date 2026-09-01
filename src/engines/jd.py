@@ -14,6 +14,7 @@ API 文档: https://union.jd.com/openplatform/api
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -41,9 +42,13 @@ class JDPermissionDenied(ApiBusinessError):
 
 
 def jd_sign(params: dict[str, str], secret: str) -> str:
-    """京东联盟签名: MD5(secret + sorted_kv + secret).upper()"""
-    from src.engines.base import md5_sign
-    return md5_sign(params, secret)
+    """京东联盟签名: MD5(secret + sorted_kv + secret).upper()
+
+    注意: SDK 使用 latin1 编码 (不是 utf-8)。
+    """
+    sorted_params = sorted(params.items())
+    sign_str = secret + "".join(f"{k}{v}" for k, v in sorted_params) + secret
+    return hashlib.md5(sign_str.encode("latin1")).hexdigest().upper()
 
 
 def _keyword_match_score(title: str, keyword: str) -> float:
@@ -70,7 +75,7 @@ class JDEngine(BaseEngine):
     """
 
     platform = Platform.JD
-    base_url = "https://api.jd.com/routerjson"
+    base_url = "https://api.jd.com/routerjson"  # SDK 用 gw.api.360buy.com 但 SSL 证书不匹配
 
     def __init__(self) -> None:
         super().__init__(_cfg.settings.jd_app_key, _cfg.settings.jd_app_secret)
@@ -83,7 +88,7 @@ class JDEngine(BaseEngine):
         return {
             "method": method,
             "app_key": self.app_key,
-            "timestamp": datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S.000+0800"),
             "format": "json",
             "v": "1.0",
             "sign_method": "md5",
@@ -91,7 +96,8 @@ class JDEngine(BaseEngine):
 
     async def _jd_request(self, method: str, biz_params: dict) -> dict:
         params = self._common_params(method)
-        params["param_json"] = json.dumps(biz_params, separators=(",", ":"))
+        # SDK 使用 360buy_param_json 作为业务参数 key (不是 param_json)
+        params["360buy_param_json"] = json.dumps(biz_params, separators=(",", ":"))
         params["sign"] = self._sign(params)
         resp = await self._request("POST", self.base_url, params=params)
         self._check_business_error(resp, method)
