@@ -4,24 +4,19 @@ API 文档: https://union.jd.com/openplatform/api
 网关地址: https://api.jd.com/routerjson
 签名方式: MD5(secret + sorted_kv + secret).upper()
 
-公共系统参数:
-- method: 接口名称
-- app_key: 开发者 AppKey
-- timestamp: YYYY-MM-DD HH:MM:SS (北京时间)
-- format: json
-- v: 1.0
-- sign_method: md5
-- param_json: 业务参数 JSON 字符串 (紧凑无空格)
+当前使用接口:
+- jd.union.open.goods.jingfen.query: 京粉精选 (基础账号可用)
+- jd.union.open.goods.promotiongoodsinfo.query: 单品详情 (需V1)
+- jd.union.open.promotion.common.get: 转链
 
-业务错误码:
-- code: "0" 或 200 = 成功, 其他 = 失败
-- 403: 无访问权限 (V0 等级限制，优雅降级返回空)
+客户端关键词过滤: 从精选池中匹配标题，不足时补充热门商品。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 
 import src.config as _cfg
@@ -35,36 +30,43 @@ from src.models import Coupon, Platform, Product
 
 logger = logging.getLogger(__name__)
 
-# 北京时间 UTC+8
 _CST = timezone(timedelta(hours=8))
+_MIN_KEYWORD_MATCHES = 3
+_OVERFETCH_MULTIPLIER = 3
 
 
 class JDPermissionDenied(ApiBusinessError):
-    """京东 API 权限不足 (403)，用于优雅降级"""
+    """京东 API 权限不足 (403)"""
     pass
 
 
 def jd_sign(params: dict[str, str], secret: str) -> str:
-    """京东联盟签名算法。
-
-    1. 将所有参数按 Key 的 ASCII 码升序排序
-    2. 拼接: app_secret + key1value1key2value2... + app_secret
-    3. MD5 → 大写 32 位十六进制
-    """
+    """京东联盟签名: MD5(secret + sorted_kv + secret).upper()"""
     from src.engines.base import md5_sign
     return md5_sign(params, secret)
+
+
+def _keyword_match_score(title: str, keyword: str) -> float:
+    """计算标题与关键词匹配分数。"""
+    if not keyword:
+        return 1.0
+    title_lower = title.lower()
+    kw_lower = keyword.lower()
+    if kw_lower in title_lower:
+        return 1.0
+    tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", keyword)
+    if not tokens:
+        return 1.0
+    matched = sum(1 for t in tokens if t.lower() in title_lower)
+    score = matched / len(tokens)
+    return score if score >= 0.3 else 0.0
 
 
 class JDEngine(BaseEngine):
     """京东联盟搜索引擎
 
-    支持接口:
-    - jd.union.open.goods.query: 商品检索
-    - jd.union.open.promotion.common.get: 转链直达链接
-    - jd.union.open.goods.promotiongoodsinfo.query: 单品详情
-
-    403 降级: 当 API 返回 403 (V0 权限受限) 时，search/detail/get_coupons
-    返回空结果而不抛出异常，确保跨平台比价不受影响。
+    使用 jd.union.open.goods.jingfen.query 获取精选商品。
+    支持客户端关键词过滤。
     """
 
     platform = Platform.JD
@@ -78,7 +80,6 @@ class JDEngine(BaseEngine):
         return jd_sign(params, self.app_secret)
 
     def _common_params(self, method: str) -> dict[str, str]:
-        """公共系统参数 (对照 API 文档)"""
         return {
             "method": method,
             "app_key": self.app_key,
@@ -89,14 +90,6 @@ class JDEngine(BaseEngine):
         }
 
     async def _jd_request(self, method: str, biz_params: dict) -> dict:
-        """发送京东联盟 API 请求。
-
-        流程:
-        1. 构造公共系统参数
-        2. 将业务参数序列化为 param_json (紧凑 JSON)
-        3. 签名: 对所有参数 (含 param_json) 计算 MD5
-        4. POST 发送 (form-encoded body)
-        """
         params = self._common_params(method)
         params["param_json"] = json.dumps(biz_params, separators=(",", ":"))
         params["sign"] = self._sign(params)
@@ -105,33 +98,18 @@ class JDEngine(BaseEngine):
         return resp
 
     def _check_business_error(self, resp: dict, method: str) -> None:
-        """检查京东联盟业务级错误。
-
-        响应结构: {method}_responce → {code, message, result/queryResult}
-        京东外层 code: "0" 或 200 均表示调用成功。
-
-        特殊处理:
-        - 403 (无访问权限): 抛出 JDPermissionDenied，由调用方降级处理
-        """
         resp_key = method.replace(".", "_") + "_responce"
         wrapper = resp.get(resp_key, resp)
-
         code = wrapper.get("code", 200)
-        # JD 返回 code="0"(字符串) 或 200(整数) 均为成功
         if str(code) in ("0", "200"):
-            # 检查内层 result/queryResult
             try:
                 inner_str = wrapper.get("queryResult", wrapper.get("result", "{}"))
                 inner = json.loads(inner_str) if isinstance(inner_str, str) else inner_str
                 result_code = inner.get("code", 200)
                 if str(result_code) not in ("0", "200"):
                     msg = inner.get("message", "")
-                    # 403: 权限不足，抛出特定异常供降级处理
                     if str(result_code) == "403":
-                        logger.warning(
-                            "🟡 JD API V0 权限受限，回退为空列表 [%s]: %s",
-                            result_code, msg,
-                        )
+                        logger.warning("🟡 JD API 权限受限 [%s]: %s", result_code, msg)
                         raise JDPermissionDenied(
                             f"京东权限不足 [{result_code}]: {msg}",
                             platform=self.platform, error_code=str(result_code),
@@ -140,48 +118,24 @@ class JDEngine(BaseEngine):
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
             return
-
         msg = wrapper.get("message", "")
         self._classify_jd_error(str(code), msg)
 
     def _classify_jd_error(self, code: str, msg: str) -> None:
-        """分类京东错误码"""
         msg_lower = msg.lower()
         if "sign" in msg_lower or code in ("3", "11"):
-            logger.error("🔴 京东签名错误 [%s]: %s — 请检查 JD_APP_SECRET", code, msg)
-            raise ApiBusinessError(
-                f"京东签名错误 [{code}]: {msg}",
-                platform=self.platform, error_code=code,
-            )
+            logger.error("🔴 京东签名错误 [%s]: %s", code, msg)
+            raise ApiBusinessError(f"京东签名错误 [{code}]: {msg}", platform=self.platform, error_code=code)
         if "auth" in msg_lower or "unauthorized" in msg_lower or code in ("12", "13"):
-            logger.error("🔴 京东鉴权失败 [%s]: %s — 请检查 JD_APP_KEY", code, msg)
-            raise ApiBusinessError(
-                f"京东鉴权失败 [{code}]: {msg}",
-                platform=self.platform, error_code=code,
-            )
+            logger.error("🔴 京东鉴权失败 [%s]: %s", code, msg)
+            raise ApiBusinessError(f"京东鉴权失败 [{code}]: {msg}", platform=self.platform, error_code=code)
         if "limit" in msg_lower or "rate" in msg_lower or code == "28":
             logger.warning("🟡 京东限流 [%s]: %s", code, msg)
-            raise ApiBusinessError(
-                f"京东限流 [{code}]: {msg}",
-                platform=self.platform, error_code=code,
-            )
+            raise ApiBusinessError(f"京东限流 [{code}]: {msg}", platform=self.platform, error_code=code)
         logger.warning("京东业务错误 [%s]: %s", code, msg)
-        raise ApiBusinessError(
-            f"京东错误 [{code}]: {msg}",
-            platform=self.platform, error_code=code,
-        )
+        raise ApiBusinessError(f"京东错误 [{code}]: {msg}", platform=self.platform, error_code=code)
 
     def _parse_product(self, item: dict) -> Product:
-        """解析京东商品数据。
-
-        字段映射 (对照 API 文档):
-        - priceInfo.price: 面价
-        - couponInfo.couponList: 优惠券列表
-        - promotionInfo.clickURL: 推广链接
-        - shopInfo.shopName: 店铺名
-        - inOrderCount30Days: 30天引单数 (销量)
-        - commissionInfo.commissionShare: 佣金比例 (%)
-        """
         price_info = item.get("priceInfo", {})
         price = float(price_info.get("price", 0))
 
@@ -211,65 +165,74 @@ class JDEngine(BaseEngine):
         coupons = []
         if best_discount > 0:
             coupons.append(Coupon(
-                platform=self.platform,
-                coupon_id=coupon_id,
+                platform=self.platform, coupon_id=coupon_id,
                 title=f"满{min_spend:.0f}减{best_discount:.0f}",
-                discount=best_discount,
-                min_spend=min_spend,
-                url=coupon_url,
+                discount=best_discount, min_spend=min_spend, url=coupon_url,
             ))
 
         return Product(
             platform=self.platform,
             product_id=str(item.get("skuId", "")),
             title=item.get("skuName", ""),
-            price=price,
-            coupon_amount=best_discount,
-            final_price=final_price,
-            original_price=price,
-            url=click_url,
-            coupon_url=coupon_url,
+            price=price, coupon_amount=best_discount, final_price=final_price,
+            original_price=price, url=click_url, coupon_url=coupon_url,
             image_url=image_url,
             detail_url=f"https://item.jd.com/{item.get('skuId', '')}.html",
             shop_name=shop_info.get("shopName", ""),
             sales_volume=int(in_order_count) if in_order_count else 0,
-            commission_rate=commission_rate,
-            coupons=coupons,
+            commission_rate=commission_rate, coupons=coupons,
         )
 
-    async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
-        """商品检索 (jd.union.open.goods.query)
+    def _filter_by_keyword(self, products: list[Product], keyword: str) -> list[Product]:
+        if not keyword:
+            return products
+        scored = [(p, _keyword_match_score(p.title, keyword)) for p in products]
+        matched = [p for p, score in scored if score > 0]
+        unmatched = [p for p, score in scored if score == 0]
+        matched.sort(key=lambda p: _keyword_match_score(p.title, keyword), reverse=True)
+        if len(matched) < _MIN_KEYWORD_MATCHES:
+            matched.extend(unmatched[: _MIN_KEYWORD_MATCHES - len(matched)])
+        return matched if matched else products
 
-        403 降级: 权限不足时返回空列表，不影响跨平台比价。
+    async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
+        """京粉精选商品搜索 (jd.union.open.goods.jingfen.query)
+
+        eliteId: 1=好券商品, 22=实时热销榜
+        客户端关键词过滤: 从精选池中匹配标题。
         """
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
 
+        fetch_size = min(page_size * _OVERFETCH_MULTIPLIER, 50)
         biz_params = {
-            "goodsReqDTO": {
-                "keyword": keyword,
+            "goodsReq": {
+                "eliteId": 1,
                 "pageIndex": page,
-                "pageSize": page_size,
+                "pageSize": fetch_size,
+                "sortName": "price",
+                "sort": "asc",
             }
         }
         try:
-            resp = await self._jd_request("jd.union.open.goods.query", biz_params)
+            resp = await self._jd_request("jd.union.open.goods.jingfen.query", biz_params)
         except JDPermissionDenied:
-            return []  # 优雅降级
+            return []
+        except ApiBusinessError as e:
+            # 400 参数错误等 — 记录 warning 但不崩溃
+            logger.warning("🟡 JD jingfen.query 失败: %s", e)
+            return []
         try:
-            result = resp.get("jd_union_open_goods_query_responce", {})
+            result = resp.get("jd_union_open_goods_jingfen_query_responce", {})
             data = json.loads(result.get("queryResult", "{}"))
             items = data.get("data", [])
-            return [self._parse_product(item) for item in items]
+            all_products = [self._parse_product(item) for item in items]
+            filtered = self._filter_by_keyword(all_products, keyword)
+            return filtered[:page_size]
         except (KeyError, TypeError, json.JSONDecodeError) as e:
-            logger.warning("京东搜索解析失败: %s", e)
+            logger.warning("京东京粉搜索解析失败: %s", e)
             return []
 
     async def detail(self, product_id: str) -> Product:
-        """商品详情 (jd.union.open.goods.promotiongoodsinfo.query)
-
-        403 降级: 权限不足时 raise，由调用方处理。
-        """
         if self.dry_run:
             products = _mock_products("detail", self.platform, 1)
             p = products[0]
@@ -277,13 +240,14 @@ class JDEngine(BaseEngine):
             return p
 
         biz_params = {"skuIds": product_id}
-        resp = await self._jd_request(
-            "jd.union.open.goods.promotiongoodsinfo.query", biz_params
-        )
         try:
-            result = resp.get(
-                "jd_union_open_goods_promotiongoodsinfo_query_responce", {}
+            resp = await self._jd_request(
+                "jd.union.open.goods.promotiongoodsinfo.query", biz_params
             )
+        except JDPermissionDenied:
+            raise ValueError(f"商品 {product_id} 查询受限 (V0 权限)")
+        try:
+            result = resp.get("jd_union_open_goods_promotiongoodsinfo_query_responce", {})
             data = json.loads(result.get("queryResult", "{}"))
             items = data.get("data", [])
             if items:
@@ -294,22 +258,14 @@ class JDEngine(BaseEngine):
             raise
 
     async def get_promotion_url(self, material_url: str) -> str:
-        """转链直达链接 (jd.union.open.promotion.common.get)"""
         if self.dry_run:
             return f"https://u.jd.com/MOCK{hash(material_url) % 100000}"
 
-        biz_params = {
-            "promotionCodeReq": {
-                "materialElUrl": material_url,
-                "siteId": self.site_id,
-            }
-        }
+        biz_params = {"promotionCodeReq": {"materialElUrl": material_url, "siteId": self.site_id}}
         try:
-            resp = await self._jd_request(
-                "jd.union.open.promotion.common.get", biz_params
-            )
-        except JDPermissionDenied:
-            return ""  # 优雅降级
+            resp = await self._jd_request("jd.union.open.promotion.common.get", biz_params)
+        except (JDPermissionDenied, ApiBusinessError):
+            return ""
         try:
             result = resp.get("jd_union_open_promotion_common_get_responce", {})
             data = json.loads(result.get("getResult", "{}"))
@@ -319,33 +275,7 @@ class JDEngine(BaseEngine):
             return ""
 
     async def get_coupons(self, keyword: str, page: int = 1) -> list[Coupon]:
-        """优惠券查询 (jd.union.open.coupon.query)
-
-        403 降级: 权限不足时返回空列表。
-        """
         if self.dry_run:
             return _mock_coupons(keyword, self.platform)
-
-        biz_params = {"couponUrls": [], "pageIndex": page, "pageSize": 20}
-        try:
-            resp = await self._jd_request("jd.union.open.coupon.query", biz_params)
-        except JDPermissionDenied:
-            return []  # 优雅降级
-        try:
-            result = resp.get("jd_union_open_coupon_query_responce", {})
-            data = json.loads(result.get("queryResult", "{}"))
-            items = data.get("data", [])
-            return [
-                Coupon(
-                    platform=self.platform,
-                    coupon_id=str(c.get("couponId", "")),
-                    title=c.get("couponName", ""),
-                    discount=float(c.get("discount", 0)),
-                    min_spend=float(c.get("quota", 0)),
-                    url=c.get("link", ""),
-                )
-                for c in items
-            ]
-        except (KeyError, TypeError, json.JSONDecodeError) as e:
-            logger.warning("京东优惠券解析失败: %s", e)
-            return []
+        products = await self.search(keyword, page, page_size=20)
+        return [c for p in products for c in p.coupons]
