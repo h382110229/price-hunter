@@ -410,7 +410,7 @@ async def resolve_short_link(url: str, *, timeout: float = 15.0) -> tuple[str | 
     try:
         async with httpx.AsyncClient(
             follow_redirects=False,  # 手动跟随，嗅探每级 Location
-            timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
+            timeout=httpx.Timeout(connect=10.0, read=timeout, write=10.0, pool=10.0),
             headers=headers,
             trust_env=False,  # 跳过 HTTP_PROXY 环境变量，避免双重代理 (TUN + HTTP proxy)
         ) as client:
@@ -482,7 +482,7 @@ async def extract_title_from_url(url: str, *, timeout: float = 15.0) -> str:
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
-            timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
+            timeout=httpx.Timeout(connect=10.0, read=timeout, write=10.0, pool=10.0),
             headers=headers,
             trust_env=False,
         ) as client:
