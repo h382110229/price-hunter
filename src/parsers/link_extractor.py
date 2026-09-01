@@ -2,19 +2,26 @@
 
 从一段包含大量干扰文字的分享文本中提取:
 - 淘口令 (￥...￥) / 淘宝短链 (m.tb.cn) / 淘宝长链 (item.taobao.com / detail.tmall.com)
-- 京东短链 (u.jd.com / 3.cn) / 京东长链 (item.jd.com/{sku_id}.html)
-- 拼多多短链 (p.pinduoduo.com) / 拼多多长链 (yangkeduo.com/goods.html)
+- 京东短链 (u.jd.com / 3.cn / 3.jd.hk) / 京东长链 (item.jd.com / item.jd.hk / npcitem.jd.hk)
+- 拼多多短链 (p.pinduoduo.com / pdd.com) / 拼多多长链 (yangkeduo.com/goods.html)
+
+支持通过 HTTP 重定向解析短链，获取落地页真实 URL 和商品标题。
 
 输出标准化结构: Platform + ItemType + itemId/URL
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 
+import httpx
+
 from src.models import Platform
+
+logger = logging.getLogger(__name__)
 
 
 class ItemType(str, Enum):
@@ -68,12 +75,17 @@ _RE_TB_BARE_ID = re.compile(r"(?:itemId|item_id|num_iid)[=:]\s*(\d+)", re.IGNORE
 # ── 京东 ──────────────────────────────────────────────────
 # 京东长链: item.jd.com/12345678.html
 _RE_JD_LONG = re.compile(r"item\.jd\.com/(\d+)\.html", re.IGNORECASE)
-# 京东短链: u.jd.com/xxx 或 3.cn/xxx
+# 京东国际长链: item.jd.hk/12345678.html, npcitem.jd.hk/12345678.html
+_RE_JD_HK_LONG = re.compile(
+    r"(?:npc)?item\.jd\.hk/(\d+)\.html", re.IGNORECASE,
+)
+# 京东短链: u.jd.com/xxx, 3.cn/xxx, 3.jd.hk/xxx
 _RE_JD_SHORT = re.compile(
-    r"(https?://(?:u\.jd\.com|3\.cn)/[^\s\u4e00-\u9fff]+)", re.IGNORECASE
+    r"(https?://(?:u\.jd\.com|3\.cn|3\.jd\.hk)/[^\s\u4e00-\u9fff]+)",
+    re.IGNORECASE,
 )
 # 京东 sku_id 关键字
-_RE_JD_SKUID = re.compile(r"(?:skuId|sku_id|wareId)[=:]\s*(\d+)", re.IGNORECASE)
+_RE_JD_SKUID = re.compile(r"(?:skuId|sku_id|wareId|sku)[=:]\s*(\d+)", re.IGNORECASE)
 
 # ── 拼多多 ────────────────────────────────────────────────
 # 拼多多长链: yangkeduo.com/goods.html?goods_id=xxx
@@ -157,8 +169,8 @@ def extract_links(text: str) -> list[ParsedLink]:
                 seen_platforms.add(Platform.TAOBAO)
 
     # ── 3. 京东链接 ───────────────────────────────────────
-    # 长链
-    jd_long = _RE_JD_LONG.search(text)
+    # 长链 (包括 jd.hk 国际)
+    jd_long = _RE_JD_LONG.search(text) or _RE_JD_HK_LONG.search(text)
     jd_short = _RE_JD_SHORT.search(text)
     jd_skuid = _RE_JD_SKUID.search(text)
 
@@ -257,3 +269,180 @@ def get_search_keyword(parsed: ParsedLink, original_title: str = "") -> str:
         # 取前 20 字符作为搜索词
         return title[:20].strip()
     return ""
+
+
+# ═══════════════════════════════════════════════════════════
+# 短链重定向解析 (异步)
+# ═══════════════════════════════════════════════════════════
+
+# 匹配落地页 URL 中的 SKU / goods_id
+_RE_URL_SKU = re.compile(
+    r"(?:item\.jd\.com|item\.jd\.hk|npcitem\.jd\.hk)[^\s]*?(?:/(\d+)\.html|[?&](?:skuId|sku|wareId)=(\d+))",
+    re.IGNORECASE,
+)
+
+# HTML <title> 提取
+_RE_HTML_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+# Open Graph title
+_RE_OG_TITLE = re.compile(
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']',
+    re.IGNORECASE,
+)
+
+# 通用短链域名列表 (需要重定向解析)
+_SHORT_LINK_DOMAINS = (
+    "u.jd.com", "3.cn", "3.jd.hk",
+    "m.tb.cn",
+    "p.pinduoduo.com", "pdd.com",
+)
+
+
+async def resolve_short_link(url: str, *, timeout: float = 8.0) -> str | None:
+    """跟随 HTTP 重定向解析短链，返回最终落地页 URL。
+
+    返回 None 表示解析失败或超时。
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Mobile/15E148"
+        ),
+    }
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
+            headers=headers,
+        ) as client:
+            resp = await client.get(url)
+            final_url = str(resp.url)
+            if final_url and final_url != url:
+                logger.info("短链解析: %s → %s", url, final_url)
+                return final_url
+            # 有些短链不重定向但返回 HTML 里有跳转
+            if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", ""):
+                # 尝试从 HTML meta refresh 或 JS 跳转提取
+                text = resp.text[:5000]
+                meta_refresh = re.search(
+                    r'url=["\']?(https?://[^"\'>\s]+)', text, re.IGNORECASE,
+                )
+                if meta_refresh:
+                    return meta_refresh.group(1)
+            return final_url if final_url != url else None
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
+        logger.warning("短链解析失败 %s: %s", url, e)
+        return None
+
+
+async def extract_title_from_url(url: str, *, timeout: float = 8.0) -> str:
+    """从落地页 HTML 中提取商品标题。
+
+    尝试顺序: og:title > <title>。返回空字符串表示失败。
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Mobile/15E148"
+        ),
+    }
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
+            headers=headers,
+        ) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return ""
+            content_type = resp.headers.get("content-type", "")
+            if "text/html" not in content_type:
+                return ""
+            html = resp.text[:20000]  # 只读前 20KB
+
+            # 优先 og:title
+            og_match = _RE_OG_TITLE.search(html)
+            if og_match:
+                title = og_match.group(1).strip()
+                if len(title) >= 4:
+                    logger.info("og:title 提取: %s", title[:60])
+                    return title
+
+            # 其次 <title>
+            title_match = _RE_HTML_TITLE.search(html)
+            if title_match:
+                title = title_match.group(1).strip()
+                # 清理常见后缀
+                for suffix in ["-京东", "-JD.COM", "｜京东", "|京东", "-淘宝", "-天猫"]:
+                    title = title.replace(suffix, "")
+                title = title.strip()
+                if len(title) >= 4:
+                    logger.info("<title> 提取: %s", title[:60])
+                    return title
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
+        logger.warning("标题提取失败 %s: %s", url, e)
+    return ""
+
+
+def extract_sku_from_url(url: str) -> str | None:
+    """从落地页 URL 中提取 SKU ID (京东) 或 goods_id (拼多多)。"""
+    # 京东 — 优先查询参数 skuId/sku/wareId (比路径更可靠)
+    jd_param = re.search(r"[?&](?:skuId|sku|wareId)=(\d+)", url)
+    if jd_param:
+        return jd_param.group(1)
+    # 京东 — 路径中的 SKU (直接跟在域名后的数字)
+    jd_path = re.search(
+        r"(?:item\.jd\.com|item\.jd\.hk|npcitem\.jd\.hk)/(\d+)\.html",
+        url, re.IGNORECASE,
+    )
+    if jd_path:
+        return jd_path.group(1)
+    # 拼多多
+    pdd_match = re.search(r"goods_id=(\d+)", url)
+    if pdd_match:
+        return pdd_match.group(1)
+    # 淘宝
+    tb_match = re.search(r"(?:id|item_id|num_iid)=(\d+)", url)
+    if tb_match:
+        return tb_match.group(1)
+    return None
+
+
+async def resolve_and_enrich(parsed: ParsedLink) -> ParsedLink:
+    """解析短链并丰富元数据: 重定向 → 提取 SKU → 提取标题关键词。
+
+    如果解析成功，会原地更新 parsed 对象的 item_id / raw_url / keyword。
+    始终返回同一个 parsed 对象 (不创建新的)。
+    """
+    if parsed.item_type != ItemType.SHORT_LINK:
+        return parsed
+
+    url = parsed.raw_url or parsed.item_id
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    # 1. 跟随重定向
+    final_url = await resolve_short_link(url)
+    if final_url:
+        parsed.raw_url = final_url
+
+        # 2. 从最终 URL 提取 SKU
+        sku = extract_sku_from_url(final_url)
+        if sku:
+            parsed.item_id = sku
+            parsed.item_type = ItemType.PRODUCT_ID
+            parsed.confidence = 0.95
+
+        # 3. 如果没有关键词，尝试从落地页提取标题
+        if not parsed.keyword:
+            title = await extract_title_from_url(final_url)
+            if title:
+                # 清洗标题，提取核心词
+                clean = title
+                for ch in "【】「」*#|｜":
+                    clean = clean.replace(ch, "")
+                clean = clean.strip()
+                parsed.keyword = clean[:40]
+
+    return parsed

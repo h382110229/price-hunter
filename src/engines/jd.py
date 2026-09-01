@@ -194,11 +194,9 @@ class JDEngine(BaseEngine):
             return products
         scored = [(p, _keyword_match_score(p.title, keyword)) for p in products]
         matched = [p for p, score in scored if score > 0]
-        unmatched = [p for p, score in scored if score == 0]
         matched.sort(key=lambda p: _keyword_match_score(p.title, keyword), reverse=True)
-        if len(matched) < _MIN_KEYWORD_MATCHES:
-            matched.extend(unmatched[: _MIN_KEYWORD_MATCHES - len(matched)])
-        return matched if matched else products
+        # 只返回真正匹配的商品，不回填无关热销品
+        return matched
 
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
         """京粉精选商品搜索 (jd.union.open.goods.jingfen.query)

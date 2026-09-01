@@ -235,7 +235,7 @@ class PDDEngine(BaseEngine):
         策略:
         1. 按匹配分数排序 (高分在前)
         2. 保留所有分数 > 0 的结果
-        3. 如果匹配数不足 _MIN_KEYWORD_MATCHES，补充未匹配的热门商品
+        3. 不回填无关商品 — 宁缺毋滥
         """
         if not keyword:
             return products
@@ -246,19 +246,15 @@ class PDDEngine(BaseEngine):
         ]
 
         matched = [p for p, score in scored if score > 0]
-        unmatched = [p for p, score in scored if score == 0]
 
-        # 按匹配分数降序排列 matched
+        # 按匹配分数降序排列
         matched.sort(
             key=lambda p: _keyword_match_score(p.title, keyword),
             reverse=True,
         )
 
-        # 如果匹配数不足，补充热门商品
-        if len(matched) < self._MIN_KEYWORD_MATCHES:
-            matched.extend(unmatched[: self._MIN_KEYWORD_MATCHES - len(matched)])
-
-        return matched if matched else products
+        # 只返回真正匹配的商品，不回填无关热销品
+        return matched
 
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
         """获取推荐商品，支持客户端关键词过滤。

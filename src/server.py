@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -23,7 +24,9 @@ from src.engines.jd import JDEngine
 from src.engines.pdd import PDDEngine
 from src.engines.taobao import TaobaoEngine
 from src.models import CompareResult, Coupon, Platform, Product, ReverseCompareResult
-from src.parsers.link_extractor import ParsedLink, extract_links, get_search_keyword
+from src.parsers.link_extractor import (
+    ParsedLink, extract_links, get_search_keyword, resolve_and_enrich,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,67 @@ async def _get_source_product(parsed: ParsedLink) -> Product | None:
             return await engine.detail(parsed.item_id)
         except Exception:
             return None
+
+
+def _tokenize(text: str) -> set[str]:
+    """将文本分词为小写 token 集合 (中文按字, 英文按单词)。"""
+    tokens = set()
+    for m in re.finditer(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", text.lower()):
+        token = m.group()
+        # 中文按 2-gram 拆分以提高匹配粒度
+        if re.match(r"[\u4e00-\u9fff]", token):
+            for i in range(len(token)):
+                tokens.add(token[i])
+            for i in range(len(token) - 1):
+                tokens.add(token[i:i+2])
+        else:
+            tokens.add(token)
+    return tokens
+
+
+def _title_similarity(title_a: str, title_b: str) -> float:
+    """计算两个商品标题的 Jaccard 相似度 (基于 token 集合)。"""
+    if not title_a or not title_b:
+        return 0.0
+    tokens_a = _tokenize(title_a)
+    tokens_b = _tokenize(title_b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+# 标题相似度阈值: 低于此值视为无关商品
+_SIMILARITY_THRESHOLD = 0.08
+
+
+def _filter_by_relevance(
+    products: list[Product], reference_title: str, keyword: str,
+) -> list[Product]:
+    """过滤掉与原品标题/关键词不相关的商品。"""
+    if not reference_title and not keyword:
+        return products
+    filtered = []
+    for p in products:
+        # 优先用原品标题做相似度匹配
+        if reference_title:
+            sim = _title_similarity(reference_title, p.title)
+            if sim >= _SIMILARITY_THRESHOLD:
+                filtered.append(p)
+                continue
+        # 回退: 用关键词做包含检查
+        if keyword:
+            kw_lower = keyword.lower()
+            title_lower = p.title.lower()
+            # 关键词的任一 token 出现在标题中即保留
+            tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", kw_lower)
+            if any(t in title_lower for t in tokens if len(t) >= 2):
+                filtered.append(p)
+                continue
+        # 既不相似也不包含关键词 → 过滤掉
+        logger.debug("过滤无关商品: %s (sim=%.2f)", p.title[:30], _title_similarity(reference_title, p.title))
+    return filtered
 
 
 # ── MCP Tools ─────────────────────────────────────────────
@@ -190,6 +254,10 @@ async def parse_and_compare(raw_text: str, page_size: int = 5) -> dict[str, Any]
 
     parsed = parsed_list[0]  # 取最高优先级
 
+    # 1b. 如果是短链，尝试跟随重定向 + 提取 SKU + 提取标题
+    if parsed.item_type.value == "short":
+        parsed = await resolve_and_enrich(parsed)
+
     # 2. 获取原品详情
     source_product = await _get_source_product(parsed)
 
@@ -203,9 +271,13 @@ async def parse_and_compare(raw_text: str, page_size: int = 5) -> dict[str, Any]
     if not keyword:
         keyword = parsed.item_id  # fallback: 用 ID 搜
 
-    # 4. 全网找同款比价 (排除原品所在平台的结果中去重)
+    # 4. 全网找同款比价
     engines = _engines()
     all_products = await _concurrent_search(engines, keyword, page=1, page_size=page_size)
+
+    # 4b. 按标题相似度过滤无关商品 (防止地漏/丝袜等无关结果混入)
+    ref_title = source_title or parsed.keyword or keyword
+    all_products = _filter_by_relevance(all_products, ref_title, keyword)
 
     # 5. 构建反向比价结果
     result = ReverseCompareResult(
