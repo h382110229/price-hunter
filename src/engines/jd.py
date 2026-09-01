@@ -14,8 +14,8 @@ API 文档: https://union.jd.com/openplatform/api
 - param_json: 业务参数 JSON 字符串 (紧凑无空格)
 
 业务错误码:
-- code: 200=成功, 其他=失败
-- message: 错误描述 (含 "sign" 关键词表示签名错误)
+- code: "0" 或 200 = 成功, 其他 = 失败
+- 403: 无访问权限 (V0 等级限制，优雅降级返回空)
 """
 
 from __future__ import annotations
@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 _CST = timezone(timedelta(hours=8))
 
 
+class JDPermissionDenied(ApiBusinessError):
+    """京东 API 权限不足 (403)，用于优雅降级"""
+    pass
+
+
 def jd_sign(params: dict[str, str], secret: str) -> str:
     """京东联盟签名算法。
 
@@ -56,6 +61,10 @@ class JDEngine(BaseEngine):
     支持接口:
     - jd.union.open.goods.query: 商品检索
     - jd.union.open.promotion.common.get: 转链直达链接
+    - jd.union.open.goods.promotiongoodsinfo.query: 单品详情
+
+    403 降级: 当 API 返回 403 (V0 权限受限) 时，search/detail/get_coupons
+    返回空结果而不抛出异常，确保跨平台比价不受影响。
     """
 
     platform = Platform.JD
@@ -89,10 +98,8 @@ class JDEngine(BaseEngine):
         4. POST 发送 (form-encoded body)
         """
         params = self._common_params(method)
-        # param_json: 业务参数的 JSON 字符串 (紧凑无空格)
         params["param_json"] = json.dumps(biz_params, separators=(",", ":"))
         params["sign"] = self._sign(params)
-        # 发送 POST 请求 (form-encoded body)
         resp = await self._request("POST", self.base_url, params=params)
         self._check_business_error(resp, method)
         return resp
@@ -102,6 +109,9 @@ class JDEngine(BaseEngine):
 
         响应结构: {method}_responce → {code, message, result/queryResult}
         京东外层 code: "0" 或 200 均表示调用成功。
+
+        特殊处理:
+        - 403 (无访问权限): 抛出 JDPermissionDenied，由调用方降级处理
         """
         resp_key = method.replace(".", "_") + "_responce"
         wrapper = resp.get(resp_key, resp)
@@ -116,6 +126,16 @@ class JDEngine(BaseEngine):
                 result_code = inner.get("code", 200)
                 if str(result_code) not in ("0", "200"):
                     msg = inner.get("message", "")
+                    # 403: 权限不足，抛出特定异常供降级处理
+                    if str(result_code) == "403":
+                        logger.warning(
+                            "🟡 JD API V0 权限受限，回退为空列表 [%s]: %s",
+                            result_code, msg,
+                        )
+                        raise JDPermissionDenied(
+                            f"京东权限不足 [{result_code}]: {msg}",
+                            platform=self.platform, error_code=str(result_code),
+                        )
                     self._classify_jd_error(str(result_code), msg)
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
@@ -165,7 +185,6 @@ class JDEngine(BaseEngine):
         price_info = item.get("priceInfo", {})
         price = float(price_info.get("price", 0))
 
-        # 提取最优优惠券 (最大面额)
         coupon_info = item.get("couponInfo", {})
         coupon_list = coupon_info.get("couponList", [])
         best_discount = 0.0
@@ -180,22 +199,12 @@ class JDEngine(BaseEngine):
             min_spend = float(best.get("quota", 0))
 
         final_price = max(0.0, price - best_discount)
-
-        # 推广链接
         promotion_info = item.get("promotionInfo", {})
         click_url = promotion_info.get("clickURL", "")
-
-        # 店铺
         shop_info = item.get("shopInfo", {})
-
-        # 销量 (30天引单数)
         in_order_count = item.get("inOrderCount30Days", item.get("inOrderCount30DaysSku", 0))
-
-        # 图片
         image_list = item.get("imageInfo", {}).get("imageList", [])
         image_url = image_list[0].get("url", "") if image_list else ""
-
-        # 佣金
         commission_info = item.get("commissionInfo", {})
         commission_rate = float(commission_info.get("commissionShare", 0) or 0)
 
@@ -231,7 +240,7 @@ class JDEngine(BaseEngine):
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
         """商品检索 (jd.union.open.goods.query)
 
-        param_json 结构: {"goodsReqDTO": {"keyword": ..., "pageIndex": ..., "pageSize": ...}}
+        403 降级: 权限不足时返回空列表，不影响跨平台比价。
         """
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
@@ -243,7 +252,10 @@ class JDEngine(BaseEngine):
                 "pageSize": page_size,
             }
         }
-        resp = await self._jd_request("jd.union.open.goods.query", biz_params)
+        try:
+            resp = await self._jd_request("jd.union.open.goods.query", biz_params)
+        except JDPermissionDenied:
+            return []  # 优雅降级
         try:
             result = resp.get("jd_union_open_goods_query_responce", {})
             data = json.loads(result.get("queryResult", "{}"))
@@ -254,7 +266,10 @@ class JDEngine(BaseEngine):
             return []
 
     async def detail(self, product_id: str) -> Product:
-        """商品详情 (jd.union.open.goods.promotiongoodsinfo.query)"""
+        """商品详情 (jd.union.open.goods.promotiongoodsinfo.query)
+
+        403 降级: 权限不足时 raise，由调用方处理。
+        """
         if self.dry_run:
             products = _mock_products("detail", self.platform, 1)
             p = products[0]
@@ -279,14 +294,7 @@ class JDEngine(BaseEngine):
             raise
 
     async def get_promotion_url(self, material_url: str) -> str:
-        """转链直达链接 (jd.union.open.promotion.common.get)
-
-        Args:
-            material_url: 商品链接或 SKU 页面 URL
-
-        Returns:
-            推广短链 (clickURL)，失败返回空字符串
-        """
+        """转链直达链接 (jd.union.open.promotion.common.get)"""
         if self.dry_run:
             return f"https://u.jd.com/MOCK{hash(material_url) % 100000}"
 
@@ -296,9 +304,12 @@ class JDEngine(BaseEngine):
                 "siteId": self.site_id,
             }
         }
-        resp = await self._jd_request(
-            "jd.union.open.promotion.common.get", biz_params
-        )
+        try:
+            resp = await self._jd_request(
+                "jd.union.open.promotion.common.get", biz_params
+            )
+        except JDPermissionDenied:
+            return ""  # 优雅降级
         try:
             result = resp.get("jd_union_open_promotion_common_get_responce", {})
             data = json.loads(result.get("getResult", "{}"))
@@ -308,12 +319,18 @@ class JDEngine(BaseEngine):
             return ""
 
     async def get_coupons(self, keyword: str, page: int = 1) -> list[Coupon]:
-        """优惠券查询 (jd.union.open.coupon.query)"""
+        """优惠券查询 (jd.union.open.coupon.query)
+
+        403 降级: 权限不足时返回空列表。
+        """
         if self.dry_run:
             return _mock_coupons(keyword, self.platform)
 
         biz_params = {"couponUrls": [], "pageIndex": page, "pageSize": 20}
-        resp = await self._jd_request("jd.union.open.coupon.query", biz_params)
+        try:
+            resp = await self._jd_request("jd.union.open.coupon.query", biz_params)
+        except JDPermissionDenied:
+            return []  # 优雅降级
         try:
             result = resp.get("jd_union_open_coupon_query_responce", {})
             data = json.loads(result.get("queryResult", "{}"))
