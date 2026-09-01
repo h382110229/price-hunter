@@ -624,8 +624,8 @@ class TestPDDKeywordFilter:
         # 至少 "无线蓝牙耳机降噪运动" 应该匹配
         assert any("蓝牙" in p.title for p in result)
 
-    def test_no_match_fallback(self):
-        """无匹配时补充热门商品"""
+    def test_no_match_returns_empty(self):
+        """无匹配时返回空列表 (不再回填无关商品)"""
         engine = self._make_engine()
         products = [
             self._make_product("苹果iPhone手机壳"),
@@ -633,8 +633,8 @@ class TestPDDKeywordFilter:
             self._make_product("洗衣液"),
         ]
         result = engine._filter_by_keyword(products, "耳机")
-        # 无匹配，应补充热门商品
-        assert len(result) >= 1
+        # 无匹配 → 返回空，不再回填无关商品
+        assert len(result) == 0
 
     def test_empty_keyword(self):
         """空关键词 → 全部通过"""

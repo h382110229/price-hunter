@@ -22,7 +22,7 @@ for var in [
 import src.config
 src.config.settings = src.config.Settings()
 
-from src.models import Platform
+from src.models import Platform, Product
 from src.parsers.link_extractor import ItemType, ParsedLink, extract_links, get_search_keyword
 
 
@@ -298,3 +298,178 @@ class TestParseAndCompare:
         assert "error" not in result
         # 淘口令优先级最高
         assert result["source_platform"] == "taobao"
+
+    @pytest.mark.asyncio
+    async def test_jd_short_link_3jdhk_recognized(self):
+        """3.jd.hk 短链被正确识别为京东短链"""
+        from src.server import parse_and_compare
+        text = "【支持siri AI】iPhone17PM 美版 https://3.jd.hk/-102POe0 点击链接"
+        result = await parse_and_compare(text, page_size=2)
+        # 应该识别到链接，不返回 "未识别" 错误
+        assert "error" not in result
+        assert result["source_platform"] == "jd"
+        # 关键词应该包含从分享文本提取的 iPhone 相关内容
+        assert result["keyword"] != ""
+
+
+# ═══════════════════════════════════════════════════════════
+# 7. JD 国际域名解析
+# ═══════════════════════════════════════════════════════════
+
+class TestJDInternationalDomains:
+    """京东国际 (jd.hk) 域名解析"""
+
+    def test_3jdhk_short_link(self):
+        """3.jd.hk 短链识别"""
+        text = "iPhone17PM https://3.jd.hk/-102POe0 点击"
+        results = extract_links(text)
+        jd = [r for r in results if r.platform == Platform.JD]
+        assert len(jd) == 1
+        assert jd[0].item_type == ItemType.SHORT_LINK
+        assert "3.jd.hk" in jd[0].raw_url
+
+    def test_item_jd_hk_long_link(self):
+        """item.jd.hk 长链提取 SKU"""
+        text = "京东国际 https://item.jd.hk/1008611040.html 限时折扣"
+        results = extract_links(text)
+        jd = [r for r in results if r.platform == Platform.JD]
+        assert len(jd) == 1
+        assert jd[0].item_type == ItemType.PRODUCT_ID
+        assert jd[0].item_id == "1008611040"
+
+    def test_npcitem_jd_hk_long_link(self):
+        """npcitem.jd.hk 长链提取 SKU"""
+        text = "海外购 https://npcitem.jd.hk/5566778899.html"
+        results = extract_links(text)
+        jd = [r for r in results if r.platform == Platform.JD]
+        assert len(jd) == 1
+        assert jd[0].item_id == "5566778899"
+
+    def test_jd_hk_with_sku_param(self):
+        """jd.hk 链接中含 skuId 参数"""
+        text = "商品 sku=9876543210"
+        results = extract_links(text)
+        jd = [r for r in results if r.platform == Platform.JD]
+        assert len(jd) == 1
+        assert jd[0].item_id == "9876543210"
+
+    def test_jd_hk_priority_over_short(self):
+        """jd.hk 长链优先级高于短链"""
+        text = "https://3.jd.hk/-abc https://item.jd.hk/123456.html"
+        results = extract_links(text)
+        jd = [r for r in results if r.platform == Platform.JD]
+        assert len(jd) == 1
+        # 长链优先
+        assert jd[0].item_type == ItemType.PRODUCT_ID
+        assert jd[0].item_id == "123456"
+
+
+# ═══════════════════════════════════════════════════════════
+# 8. SKU 提取函数
+# ═══════════════════════════════════════════════════════════
+
+class TestExtractSkuFromUrl:
+    """extract_sku_from_url URL 中 SKU 提取"""
+
+    def test_jd_com_sku(self):
+        """item.jd.com/{sku}.html"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        assert extract_sku_from_url("https://item.jd.com/100012345.html") == "100012345"
+
+    def test_jd_hk_sku(self):
+        """item.jd.hk/{sku}.html"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        assert extract_sku_from_url("https://item.jd.hk/1008611040.html") == "1008611040"
+
+    def test_npcitem_jd_hk_sku(self):
+        """npcitem.jd.hk/{sku}.html"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        assert extract_sku_from_url("https://npcitem.jd.hk/55667788.html") == "55667788"
+
+    def test_jd_query_param_sku(self):
+        """URL query 中的 skuId"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        url = "https://item.jd.com/product/123.html?skuId=998877&other=1"
+        assert extract_sku_from_url(url) == "998877"
+
+    def test_pdd_goods_id(self):
+        """拼多多 goods_id"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        url = "https://mobile.yangkeduo.com/goods.html?goods_id=12345678"
+        assert extract_sku_from_url(url) == "12345678"
+
+    def test_taobao_id(self):
+        """淘宝 id 参数"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        url = "https://item.taobao.com/item.htm?id=6543210&spm=xxx"
+        assert extract_sku_from_url(url) == "6543210"
+
+    def test_no_match(self):
+        """无匹配返回 None"""
+        from src.parsers.link_extractor import extract_sku_from_url
+        assert extract_sku_from_url("https://www.example.com/page") is None
+
+
+# ═══════════════════════════════════════════════════════════
+# 9. 标题相似度过滤 (server.py)
+# ═══════════════════════════════════════════════════════════
+
+class TestTitleSimilarity:
+    """标题相似度计算与相关性过滤"""
+
+    def test_identical_titles(self):
+        """完全相同标题 → 相似度 1.0"""
+        from src.server import _title_similarity
+        sim = _title_similarity("iPhone 17 Pro Max 美版", "iPhone 17 Pro Max 美版")
+        assert sim == 1.0
+
+    def test_similar_titles(self):
+        """相似标题 → 高相似度"""
+        from src.server import _title_similarity
+        sim = _title_similarity(
+            "iPhone 17 Pro Max 美版 支持siri AI",
+            "Apple iPhone17PM 美版 256G",
+        )
+        assert sim > 0.15  # 共享 iphone, 美版 等 token
+
+    def test_unrelated_titles(self):
+        """完全无关标题 → 低相似度"""
+        from src.server import _title_similarity
+        sim = _title_similarity(
+            "iPhone 17 Pro Max 美版",
+            "漩涡地漏浴室下水道盖头防堵过滤网",
+        )
+        assert sim < 0.08  # 低于阈值
+
+    def test_empty_title(self):
+        """空标题 → 0"""
+        from src.server import _title_similarity
+        assert _title_similarity("", "test") == 0.0
+        assert _title_similarity("test", "") == 0.0
+
+    def test_filter_removes_unrelated(self):
+        """_filter_by_relevance 过滤无关商品"""
+        from src.server import _filter_by_relevance
+        products = [
+            Product(platform=Platform.JD, product_id="1", title="iPhone17PM 美版 256G", price=5000, final_price=5000),
+            Product(platform=Platform.JD, product_id="2", title="漩涡地漏浴室下水道盖头防堵", price=10, final_price=10),
+            Product(platform=Platform.PDD, product_id="3", title="阿凡迪7D超薄隐形丝袜", price=40, final_price=40),
+            Product(platform=Platform.TAOBAO, product_id="4", title="iPhone 17 Pro Max 手机壳", price=30, final_price=30),
+        ]
+        filtered = _filter_by_relevance(products, "iPhone 17 Pro Max 美版", "iPhone17PM")
+        # 地漏和丝袜应被过滤掉
+        titles = [p.title for p in filtered]
+        assert any("iPhone" in t for t in titles)
+        assert not any("地漏" in t for t in titles)
+        assert not any("丝袜" in t for t in titles)
+
+    def test_filter_keyword_fallback(self):
+        """当无原品标题时，用关键词做过滤"""
+        from src.server import _filter_by_relevance
+        products = [
+            Product(platform=Platform.JD, product_id="1", title="无线蓝牙耳机降噪", price=100, final_price=100),
+            Product(platform=Platform.JD, product_id="2", title="不锈钢地漏防臭", price=20, final_price=20),
+        ]
+        filtered = _filter_by_relevance(products, "", "蓝牙耳机")
+        assert len(filtered) == 1
+        assert "蓝牙" in filtered[0].title or "耳机" in filtered[0].title

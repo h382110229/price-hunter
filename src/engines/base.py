@@ -119,8 +119,18 @@ _DEFAULT_MOCKS = [
 
 
 def _mock_products(keyword: str, platform: Platform, page_size: int = 5) -> list[Product]:
-    """生成 Mock 商品列表，结构完全匹配真实 API 响应映射。"""
-    templates = _MOCK_KEYWORDS.get(keyword, _DEFAULT_MOCKS)
+    """生成 Mock 商品列表，结构完全匹配真实 API 响应。
+
+    当关键词不在已知 mock 库中时，使用关键词生成标题，避免返回完全无关的商品。
+    """
+    templates = _MOCK_KEYWORDS.get(keyword, None)
+    if templates is None:
+        # 用关键词生成 mock 标题，而非回填无关的默认商品
+        templates = [
+            {"title": f"{keyword} 品质款", "price": 199.0, "coupon": 30.0, "shop": f"{keyword}旗舰店", "sales": 10000},
+            {"title": f"{keyword} 经济实惠装", "price": 99.0, "coupon": 20.0, "shop": f"{keyword}专营", "sales": 5000},
+            {"title": f"{keyword} 高端旗舰版", "price": 399.0, "coupon": 50.0, "shop": f"{keyword}官方", "sales": 3000},
+        ]
     products = []
     now = datetime.now()
     for i, t in enumerate(templates[:page_size]):
