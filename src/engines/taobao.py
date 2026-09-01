@@ -1,18 +1,29 @@
 """淘宝联盟 (Taobao客 TOP API) 引擎。
 
 API 文档: https://open.taobao.com/api.htm?docId=28541&docType=2
+网关地址: https://eco.taobao.com/router/rest
 签名方式: MD5(secret + sorted_kv + secret).upper()
-接口: taobao.tbk.dg.material.optional (物料搜索)
 
-业务错误码:
-- error_response.sub_code: "Invalid Sign" | "Invalid AppKey" | "Unauthorized" | "流量限制" 等
+公共参数:
+- method: 接口名称
+- app_key: 开发者 AppKey
+- timestamp: YYYY-MM-DD HH:MM:SS (北京时间)
+- format: json
+- v: 2.0
+- sign_method: md5
+
+业务参数 (material.optional):
+- adzone_id: 推广位 ID
+- q: 搜索关键词
+- page_no / page_size: 分页
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import src.config as _cfg
 from src.engines.base import (
@@ -25,14 +36,33 @@ from src.models import Coupon, Platform, Product
 
 logger = logging.getLogger(__name__)
 
+_CST = timezone(timedelta(hours=8))
+
 # 淘宝 TOP API 已知业务错误码
 _TB_SIGN_ERRORS = {"Invalid Sign", "Invalid Signature"}
 _TB_AUTH_ERRORS = {"Invalid AppKey", "Unauthorized", "Invalid Session"}
 _TB_RATE_LIMIT = {"流量限制", "Fail Flow Limit", "THIRDPART_TRAFFIC_LIMIT"}
 
 
+def taobao_sign(params: dict[str, str], secret: str) -> str:
+    """淘宝 TOP API 签名算法。
+
+    1. 剔除 sign 字段
+    2. 所有参数按 Key 的 ASCII 码升序排序
+    3. 拼接: secret + key1value1key2value2... + secret
+    4. MD5 → 大写 32 位十六进制
+    """
+    filtered = {k: v for k, v in params.items() if k != "sign"}
+    sorted_params = sorted(filtered.items())
+    sign_str = secret + "".join(f"{k}{v}" for k, v in sorted_params) + secret
+    return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
+
+
 class TaobaoEngine(BaseEngine):
-    """淘宝联盟搜索引擎"""
+    """淘宝联盟搜索引擎
+
+    使用 taobao.tbk.dg.material.optional 接口搜索商品。
+    """
 
     platform = Platform.TAOBAO
     base_url = "https://eco.taobao.com/router/rest"
@@ -42,15 +72,13 @@ class TaobaoEngine(BaseEngine):
         self.adzone_id = _cfg.settings.tb_adzone_id
 
     def _sign(self, params: dict[str, str]) -> str:
-        from src.engines.base import md5_sign
-
-        return md5_sign(params, self.app_secret)
+        return taobao_sign(params, self.app_secret)
 
     def _common_params(self, method: str) -> dict[str, str]:
         return {
             "method": method,
             "app_key": self.app_key,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S"),
             "format": "json",
             "v": "2.0",
             "sign_method": "md5",
@@ -66,7 +94,6 @@ class TaobaoEngine(BaseEngine):
         return resp
 
     def _check_business_error(self, resp: dict) -> None:
-        """检查淘宝 TOP API 业务级错误"""
         if "error_response" not in resp:
             return
         err = resp["error_response"]
@@ -92,7 +119,6 @@ class TaobaoEngine(BaseEngine):
                 f"淘宝限流: {sub_code} — {msg}",
                 platform=self.platform, error_code=code, sub_code=sub_code,
             )
-        # 其他业务错误
         logger.warning("淘宝业务错误 [%s/%s]: %s", code, sub_code, msg)
         raise ApiBusinessError(
             f"淘宝错误 [{code}/{sub_code}]: {msg}",
@@ -100,22 +126,43 @@ class TaobaoEngine(BaseEngine):
         )
 
     def _parse_product(self, item: dict) -> Product:
+        """解析淘宝商品数据。
+
+        字段映射 (对照 API 文档):
+        - title: 商品标题
+        - zk_final_price: 一口价/券前价
+        - coupon_amount: 优惠券面额 (元)
+        - coupon_start_fee: 券使用门槛
+        - coupon_click_url: 领券链接
+        - volume: 30天销量
+        - click_url / url: 推广链接
+        - pict_url: 主图
+        - shop_title: 店铺名
+        - commission_rate: 佣金比例 (%)
+        """
+        # 价格
         price = float(item.get("zk_final_price", 0) or item.get("reserve_price", 0))
+
+        # 优惠券
         coupon_amount = float(item.get("coupon_amount", 0) or 0)
         final_price = max(0.0, price - coupon_amount)
 
+        # 推广链接
+        click_url = item.get("click_url", item.get("url", ""))
+
+        # 销量
+        volume = int(item.get("volume", item.get("tk_total_sales", 0)) or 0)
+
         coupons = []
         if coupon_amount > 0:
-            coupons.append(
-                Coupon(
-                    platform=self.platform,
-                    coupon_id=str(item.get("coupon_id", "")),
-                    title=item.get("coupon_info", f"满减{coupon_amount}元"),
-                    discount=coupon_amount,
-                    min_spend=float(item.get("coupon_start_fee", price) or price),
-                    url=item.get("coupon_click_url", ""),
-                )
-            )
+            coupons.append(Coupon(
+                platform=self.platform,
+                coupon_id=str(item.get("coupon_id", "")),
+                title=item.get("coupon_info", f"满减{coupon_amount}元"),
+                discount=coupon_amount,
+                min_spend=float(item.get("coupon_start_fee", price) or price),
+                url=item.get("coupon_click_url", item.get("coupon_share_url", "")),
+            ))
 
         return Product(
             platform=self.platform,
@@ -125,24 +172,30 @@ class TaobaoEngine(BaseEngine):
             coupon_amount=coupon_amount,
             final_price=final_price,
             original_price=float(item.get("reserve_price", 0) or 0),
-            url=item.get("click_url", item.get("url", "")),
-            coupon_url=item.get("coupon_click_url", ""),
+            url=click_url,
+            coupon_url=item.get("coupon_share_url", item.get("coupon_click_url", "")),
             tkl_or_command=item.get("tkl", ""),
             image_url=item.get("pict_url", ""),
             detail_url=item.get("item_url", ""),
             shop_name=item.get("shop_title", item.get("nick", "")),
-            sales_volume=int(item.get("tk_total_sales", 0) or 0),
+            sales_volume=volume,
             commission_rate=float(item.get("commission_rate", 0) or 0),
             coupons=coupons,
         )
 
     async def search(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Product]:
+        """商品搜索 (taobao.tbk.dg.material.optional)"""
         if self.dry_run:
             return _mock_products(keyword, self.platform, page_size)
 
         resp = await self._top_request(
             "taobao.tbk.dg.material.optional",
-            {"adzone_id": self.adzone_id, "q": keyword, "page_no": str(page), "page_size": str(page_size)},
+            {
+                "adzone_id": self.adzone_id,
+                "q": keyword,
+                "page_no": str(page),
+                "page_size": str(page_size),
+            },
         )
         try:
             result = resp.get("tbk_dg_material_optional_response", {})
@@ -153,6 +206,7 @@ class TaobaoEngine(BaseEngine):
             return []
 
     async def detail(self, product_id: str) -> Product:
+        """商品详情 (taobao.tbk.item.info.get)"""
         if self.dry_run:
             products = _mock_products("detail", self.platform, 1)
             p = products[0]
@@ -171,6 +225,7 @@ class TaobaoEngine(BaseEngine):
             raise
 
     async def get_coupons(self, keyword: str, page: int = 1) -> list[Coupon]:
+        """优惠券查询 (taobao.tbk.coupon.get)"""
         if self.dry_run:
             return _mock_coupons(keyword, self.platform)
 

@@ -215,6 +215,103 @@ class TestTaobaoEngineDryRun:
             assert all(c.platform == Platform.TAOBAO for c in coupons)
 
 
+class TestTaobaoSigning:
+    """淘宝 TOP API 签名单元测试"""
+
+    def test_taobao_sign_basic(self):
+        """基本签名: MD5(secret + sorted_kv + secret).upper()"""
+        from src.engines.taobao import taobao_sign
+        params = {
+            "method": "taobao.tbk.dg.material.optional",
+            "app_key": "test_key",
+            "timestamp": "2026-09-01 12:00:00",
+        }
+        secret = "test_secret"
+        result = taobao_sign(params, secret)
+        assert len(result) == 32
+        assert result == result.upper()
+
+    def test_taobao_sign_excludes_sign_field(self):
+        """签名时剔除 sign 字段"""
+        from src.engines.taobao import taobao_sign
+        params = {"a": "1", "sign": "should_be_ignored", "b": "2"}
+        params_without = {"a": "1", "b": "2"}
+        assert taobao_sign(params, "sec") == taobao_sign(params_without, "sec")
+
+    def test_taobao_sign_order_independent(self):
+        """参数顺序不影响签名"""
+        from src.engines.taobao import taobao_sign
+        p1 = {"b": "2", "a": "1"}
+        p2 = {"a": "1", "b": "2"}
+        assert taobao_sign(p1, "sec") == taobao_sign(p2, "sec")
+
+    def test_taobao_sign_known_vector(self):
+        """已知向量验算"""
+        from src.engines.taobao import taobao_sign
+        import hashlib
+        params = {"method": "test", "app_key": "key"}
+        secret = "sec"
+        sorted_kv = "app_keykeymethodtest"
+        expected = hashlib.md5((secret + sorted_kv + secret).encode()).hexdigest().upper()
+        assert taobao_sign(params, secret) == expected
+
+
+class TestTaobaoProductParsing:
+    """淘宝商品解析回归测试"""
+
+    def _make_engine(self):
+        return TaobaoEngine()
+
+    def test_zk_final_price(self):
+        """zk_final_price 作为面价"""
+        engine = self._make_engine()
+        item = {"zk_final_price": "199.9", "title": "测试"}
+        p = engine._parse_product(item)
+        assert p.price == 199.9
+
+    def test_coupon_amount(self):
+        """coupon_amount 正确解析"""
+        engine = self._make_engine()
+        item = {"zk_final_price": "100", "coupon_amount": "30", "title": "测试"}
+        p = engine._parse_product(item)
+        assert p.coupon_amount == 30.0
+        assert p.final_price == 70.0
+
+    def test_no_coupon(self):
+        """无券时 final_price = price"""
+        engine = self._make_engine()
+        item = {"zk_final_price": "50", "coupon_amount": "0", "title": "测试"}
+        p = engine._parse_product(item)
+        assert p.coupon_amount == 0.0
+        assert p.final_price == 50.0
+
+    def test_volume_sales(self):
+        """volume 字段作为销量"""
+        engine = self._make_engine()
+        item = {"zk_final_price": "100", "volume": 12345, "title": "测试"}
+        p = engine._parse_product(item)
+        assert p.sales_volume == 12345
+
+    def test_coupon_url_fields(self):
+        """coupon_share_url 和 coupon_click_url 正确映射"""
+        engine = self._make_engine()
+        item = {
+            "zk_final_price": "100", "coupon_amount": "10",
+            "coupon_share_url": "https://share.url", "coupon_click_url": "https://click.url",
+            "title": "测试",
+        }
+        p = engine._parse_product(item)
+        assert p.coupon_url == "https://share.url"
+        assert p.coupons[0].url == "https://click.url"
+
+    def test_shop_title(self):
+        """店铺名从 shop_title 提取"""
+        engine = self._make_engine()
+        item = {"zk_final_price": "100", "shop_title": "测试旗舰店", "title": "测试"}
+        p = engine._parse_product(item)
+        assert p.shop_name == "测试旗舰店"
+
+
 class TestJDEngineDryRun:
     """京东引擎 Dry-run 模式"""
 
